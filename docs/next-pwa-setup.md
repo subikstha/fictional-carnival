@@ -1,37 +1,75 @@
 # Next-PWA Setup & Service Worker Registration Guide
 
-This guide walks through setting up `next-pwa` in `next.config.ts`, handling TypeScript declarations, configuring service worker registration (automatic vs. manual for Web Push), and adding custom background push notifications.
+This guide covers setting up `next-pwa` in modern Next.js (App Router, Next.js 15/16), resolving TypeScript type conflicts, fixing why service workers fail to register automatically in the App Router, and implementing Web Push notification handlers.
 
 ---
 
-## 1. Install TypeScript Definitions
+## 1. TypeScript Types Setup
 
-Because `next-pwa` is a CommonJS package that does not bundle type definitions out of the box, install the community types:
+### The Problem with `@types/next-pwa`
+If you install `@types/next-pwa`, npm pulls an outdated nested dependency on Next.js 12/13. In modern Next.js (15/16), configuration types like `i18n.domains` were updated to be `readonly`. This produces the following error on `export default withPWA(nextConfig)`:
 
-```bash
-npm install -D @types/next-pwa
+```text
+Type 'I18NDomains | undefined' is not assignable to type 'DomainLocale[] | undefined'.
+The type 'I18NDomains' is 'readonly' and cannot be assigned to the mutable type 'DomainLocale[]'.
 ```
 
-> **Alternative**: If you prefer not to install `@types/next-pwa`, add a declaration in your `next-env.d.ts` or a new `types/next-pwa.d.ts`:
-> ```typescript
-> declare module "next-pwa";
-> ```
+### The Solution: Custom Type Declaration
+Instead of installing `@types/next-pwa`, uninstall it (if installed) and declare a clean type definition in `types/next-pwa.d.ts` (or `next-env.d.ts`):
+
+```bash
+npm uninstall @types/next-pwa
+```
+
+Create `types/next-pwa.d.ts`:
+
+```typescript
+// types/next-pwa.d.ts
+declare module "next-pwa" {
+  import type { NextConfig } from "next";
+
+  export interface PWAConfig {
+    dest?: string;
+    disable?: boolean;
+    register?: boolean;
+    scope?: string;
+    sw?: string;
+    skipWaiting?: boolean;
+    clientsClaim?: boolean;
+    cleanupOutdatedCaches?: boolean;
+    cacheOnFrontEndNav?: boolean;
+    reloadOnOnline?: boolean;
+    customWorkerDir?: string;
+    subdomainPrefix?: string;
+    fallbacks?: Record<string, string>;
+    publicExcludes?: string[];
+    buildExcludes?: (string | RegExp)[];
+    [key: string]: unknown;
+  }
+
+  export default function withPWAInit(
+    pluginOptions?: PWAConfig
+  ): (nextConfig?: NextConfig) => NextConfig;
+}
+```
+
+*(Alternatively, if you keep `@types/next-pwa`, you can bypass the check with `export default withPWA(nextConfig as any);`)*
 
 ---
 
 ## 2. Configure `next.config.ts`
 
-Import `withPWAInit` from `next-pwa` and wrap your existing Next.js configuration:
+Import `withPWAInit` and wrap your Next.js configuration:
 
 ```typescript
 import type { NextConfig } from "next";
 import withPWAInit from "next-pwa";
 
 const withPWA = withPWAInit({
-  dest: "public", // Directory where sw.js and workbox assets will be output
-  register: true, // Set to true for automatic registration, or false for manual control
-  skipWaiting: true, // Forces waiting service workers to activate immediately
-  disable: process.env.NODE_ENV === "development", // Disable PWA during development to avoid caching issues
+  dest: "public", // Service worker files will be generated into /public
+  register: false, // Set to false: App Router requires manual registration (see Section 4)
+  skipWaiting: true, // Activates updated service workers immediately
+  disable: process.env.NODE_ENV === "development", // Disable in dev to prevent caching issues
 });
 
 const nextConfig: NextConfig = {
@@ -55,58 +93,118 @@ export default withPWA(nextConfig);
 
 ---
 
-## 3. Registration Strategies
+## 3. Webpack Build Flag (Mandatory for Next.js 16+)
 
-### Option A: Automatic Registration (`register: true`)
+`next-pwa` is a **Webpack-only** plugin that injects `workbox-webpack-plugin`. 
 
-When `register: true` is configured in `withPWAInit`:
-- `next-pwa` injects a script into the client bundle that registers the service worker (`/sw.js`) automatically via `workbox-window`.
-- No extra clientside registration code is needed.
+Because Next.js 16 uses **Turbopack by default** for `next build`, running the standard build command will bypass Webpack, and `sw.js` will **never** be generated.
 
-### Option B: Manual Registration (`register: false`)
+In `package.json`, update your build script to include the `--webpack` flag:
 
-If you are implementing **Web Push Notifications**, you often need direct access to the `ServiceWorkerRegistration` object to manage push subscriptions (`registration.pushManager.subscribe(...)`).
-
-1. Set `register: false` in `next.config.ts`:
-   ```typescript
-   const withPWA = withPWAInit({
-     dest: "public",
-     register: false,
-     skipWaiting: true,
-     disable: process.env.NODE_ENV === "development",
-   });
-   ```
-
-2. Register the service worker manually in a client component or hook:
-   ```typescript
-   "use client";
-
-   import { useEffect } from "react";
-
-   export function ServiceWorkerManager() {
-     useEffect(() => {
-       if ("serviceWorker" in navigator) {
-         navigator.serviceWorker
-           .register("/sw.js")
-           .then((registration) => {
-             console.log("Service Worker registered with scope:", registration.scope);
-             // You can now access registration.pushManager
-           })
-           .catch((error) => {
-             console.error("Service Worker registration failed:", error);
-           });
-       }
-     }, []);
-
-     return null;
-   }
-   ```
+```json
+"scripts": {
+  "dev": "next dev",
+  "build": "next build --webpack",
+  "start": "next start",
+  "lint": "eslint"
+}
+```
 
 ---
 
-## 4. Custom Service Worker for Web Push
+## 4. Why `sw.js` Does NOT Auto-Register in the App Router
 
-`next-pwa` automatically detects and compiles a custom worker file located at `worker/index.ts` (or `worker/index.js`) in your project root, bundling its logic into the generated `public/sw.js`.
+Even when `public/sw.js` is generated and `register: true` is configured in `next.config.ts`, you may notice that **no service worker is registered in DevTools (Application > Service Workers)**.
+
+### Root Cause
+`next-pwa` was authored when Next.js only had the **Pages Router** (`pages/`). Under the hood, `next-pwa` attempts to inject its registration script into the client bundle by looking for:
+
+```javascript
+// Inside node_modules/next-pwa/index.js
+const registerJs = path.join(__dirname, 'register.js')
+const entry = config.entry
+config.entry = () =>
+  entry().then(entries => {
+    if (entries['main.js'] && !entries['main.js'].includes(registerJs)) {
+      entries['main.js'].unshift(registerJs)
+    }
+    return entries
+  })
+```
+
+In the Next.js **App Router** (`app/` directory):
+- Client entry points are named `main-app.js` (not `main.js`).
+- `entries['main.js']` is `undefined`.
+- `next-pwa` silently skips injecting `register.js` into your bundle.
+- As a result, `/sw.js` is built and accessible in `/public`, but **no browser script ever invokes `navigator.serviceWorker.register('/sw.js')`**.
+
+---
+
+## 5. The Solution: Explicit Client Registration
+
+To ensure the service worker registers reliably across all App Router pages:
+
+### Step 1: Create a Client Registration Component
+Create `app/sw-register.tsx`:
+
+```tsx
+"use client";
+
+import { useEffect } from "react";
+
+export function ServiceWorkerRegister() {
+  useEffect(() => {
+    if ("serviceWorker" in navigator && process.env.NODE_ENV === "production") {
+      navigator.serviceWorker
+        .register("/sw.js")
+        .then((registration) => {
+          console.log("Service Worker registered with scope:", registration.scope);
+        })
+        .catch((error) => {
+          console.error("Service Worker registration failed:", error);
+        });
+    }
+  }, []);
+
+  return null;
+}
+```
+
+### Step 2: Mount it in `app/layout.tsx`
+Import and include `<ServiceWorkerRegister />` inside the `<body>` of your root layout:
+
+```tsx
+// app/layout.tsx
+import type { Metadata } from "next";
+import { ServiceWorkerRegister } from "./sw-register";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "Web Push App",
+  description: "Next.js App with Service Worker & Web Push",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body>
+        <ServiceWorkerRegister />
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+---
+
+## 6. Custom Service Worker for Web Push (`worker/index.ts`)
+
+`next-pwa` automatically detects and compiles a custom worker file placed at `worker/index.ts` (or `worker/index.js`) in your project root, bundling it directly into `public/sw.js`.
 
 Create `worker/index.ts`:
 
@@ -114,12 +212,12 @@ Create `worker/index.ts`:
 // worker/index.ts
 declare const self: ServiceWorkerGlobalScope;
 
-// Handle incoming push notifications
+// 1. Listen for push notifications sent from server
 self.addEventListener("push", (event) => {
   const data = event.data ? event.data.json() : {};
-  const title = data.title || "Notification";
+  const title = data.title || "New Notification";
   const options: NotificationOptions = {
-    body: data.body || "You have a new update.",
+    body: data.body || "You have a new message.",
     icon: "/icon-192x192.png",
     badge: "/badge-72x72.png",
     data: data.url || "/",
@@ -128,7 +226,7 @@ self.addEventListener("push", (event) => {
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
-// Handle notification click to focus or open window
+// 2. Handle notification clicks
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const urlToOpen = event.notification.data || "/";
@@ -152,10 +250,10 @@ export {};
 
 ---
 
-## 5. Build, Test, and Git Ignore
+## 7. Build, Test, and Git Ignore
 
-### Ignore Generated Files
-Add the generated files to your `.gitignore`:
+### 1. Add Generated Files to `.gitignore`
+Prevent generated worker files from being committed:
 
 ```gitignore
 # PWA generated service worker files
@@ -165,18 +263,16 @@ public/workbox-*.js
 public/workbox-*.js.map
 ```
 
-### Build & Run
-Because `disable: process.env.NODE_ENV === "development"` is typically set, the service worker is only generated during production builds:
-
+### 2. Build and Test
 ```bash
-# 1. Build the production application
+# Build using Webpack so next-pwa runs
 npm run build
 
-# 2. Start the production server
-npm run start
+# Start the production server on your port (e.g., 8009)
+npm run start -- -p 8009
 ```
 
-### Verification
-1. Open your browser and navigate to `http://localhost:3000`.
-2. Open DevTools (`F12`) and go to **Application** > **Service Workers**.
-3. Verify that `/sw.js` is active and running.
+### 3. Verify in Chrome DevTools
+1. Open `http://localhost:8009`.
+2. Open DevTools (`F12`) &rarr; **Application** tab &rarr; **Service Workers**.
+3. You will see `/sw.js` registered and active with status: **Activated and is running**.
