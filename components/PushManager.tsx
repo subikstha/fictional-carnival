@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { getToken, onMessage } from "firebase/messaging";
 import { getClientMessaging } from "@/lib/firebase";
 
@@ -12,10 +12,42 @@ export function PushManager() {
   } | null>(null);
   const [permission, setPermission] =
     useState<NotificationPermission>("default");
+  const [loading, setLoading] = useState(false);
+
+  // Helper function to get fcm token
+  const retrieveToken = useCallback(async () => {
+    try {
+      setLoading(true);
+      const registration = await navigator.serviceWorker.ready;
+      const messaging = await getClientMessaging();
+
+      if (!messaging) return;
+
+      const currentToken = await getToken(messaging, {
+        vapidKey: process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY,
+        serviceWorkerRegistration: registration,
+      });
+
+      if (currentToken) {
+        console.log("FCM token got from retrive Token", currentToken);
+        setToken(currentToken);
+      }
+    } catch (error) {
+      console.error("Error retrieving token", error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if ("Notification" in window) {
+      const currentPerm = Notification.permission;
       setPermission(Notification.permission);
+
+      // Auto fetch the token on refresh if already granted
+      if (currentPerm === "granted") {
+        retrieveToken();
+      }
     }
 
     // Listen to foreground notifications when tab is open
@@ -29,7 +61,7 @@ export function PushManager() {
         });
       });
     });
-  }, []);
+  }, [retrieveToken]);
 
   const handleSubscribe = async () => {
     try {
@@ -82,7 +114,7 @@ export function PushManager() {
           <p className="text-xs text-green-600 dark:text-green-400 font-semibold mb-2">
             ✓ Push notifications enabled
           </p>
-          {token && (
+          {token && !loading && (
             <div className="mt-2">
               <label className="text-xs text-zinc-500 block mb-1">
                 Your FCM Token (for testing):
@@ -110,3 +142,5 @@ export function PushManager() {
     </div>
   );
 }
+
+PushManager.displayName = "PushManager";
