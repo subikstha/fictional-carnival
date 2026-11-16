@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ServiceWorkerRegister } from "./sw-register";
 import InstallPWA from "@/components/InstallButton";
+import { Header } from "@/components/Header";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -40,6 +41,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <ServiceWorkerRegister />
 
       <body className="min-h-full flex flex-col">
+        <Header />
         {children}
         <InstallPWA />
       </body>
