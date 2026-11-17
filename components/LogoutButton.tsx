@@ -4,9 +4,12 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { deleteToken } from "firebase/messaging";
 import { getClientMessaging } from "@/lib/firebase";
-import { signOut } from "next-auth/react";
+import { signOut, useSession } from "next-auth/react";
 
 export function LogoutButton() {
+  const currentSession = useSession();
+  const { data: sessionData } = currentSession || {};
+  console.log("current session in logout button", sessionData);
   const [loading, setLoading] = useState(false);
   const router = useRouter();
 
@@ -18,9 +21,10 @@ export function LogoutButton() {
       if (messaging) {
         // Attempt to unregister from our database before revoking from Google
         const registration = await navigator.serviceWorker.ready;
-        const currentToken = await registration.pushManager
-          .getSubscription()
-          .then((sub) => (sub ? sub.endpoint : null));
+        const currentToken = localStorage.getItem(
+          `fcmToken_${sessionData?.user?.name}`,
+        );
+
         console.log("Current token when logging out", currentToken);
         // Or pass the known token stored in state/storage
         if (currentToken) {

@@ -5,7 +5,13 @@ import { getToken, onMessage } from "firebase/messaging";
 import { getClientMessaging } from "@/lib/firebase";
 import { SendNotificationForm } from "./SendNotificationForm";
 
-export function PushManager({ email }: { email: string }) {
+export function PushManager({
+  email,
+  username,
+}: {
+  email: string;
+  username: string;
+}) {
   const [token, setToken] = useState<string | null>(null);
   const [notification, setNotification] = useState<{
     title?: string;
@@ -32,6 +38,7 @@ export function PushManager({ email }: { email: string }) {
       if (currentToken) {
         console.log("FCM token got from retrive Token", currentToken);
         setToken(currentToken);
+        localStorage.setItem(`fcmToken_${username}`, currentToken);
         // Call the backend api to save the token
         await fetch("/api/notifications/register-token", {
           method: "POST",
@@ -99,7 +106,7 @@ export function PushManager({ email }: { email: string }) {
       if (currentToken) {
         console.log("FCM token", currentToken);
         setToken(currentToken);
-
+        localStorage.setItem(`fcmToken_${username}`, currentToken);
         // Call the backend api to save the token
         await fetch("/api/notifications/register-token", {
           method: "POST",
