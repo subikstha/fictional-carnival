@@ -61,6 +61,16 @@ export async function POST(request: Request) {
         actionUrl: actionUrl,
         sendAt: new Date().toISOString(),
       },
+      webpush: {
+        headers: {
+          Urgency: "high",
+        },
+        notification: {
+          icon: "/favicon.ico",
+          badge: "/favicon.ico",
+          requireInteraction: true,
+        },
+      },
     });
 
     // 5. Clean up stale/invalid tokens reported by Firebase

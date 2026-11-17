@@ -356,6 +356,16 @@ export async function POST(request: Request) {
         actionUrl: actionUrl,
         sentAt: new Date().toISOString(),
       },
+      webpush: {
+        headers: {
+          Urgency: "high", // 'very-low' | 'low' | 'normal' | 'high'
+        },
+        notification: {
+          icon: "/favicon.ico",
+          badge: "/favicon.ico",
+          requireInteraction: true, // Keeps toast visible on desktop until dismissed
+        },
+      },
     });
 
     // 5. Clean up stale/invalid tokens reported by Firebase
@@ -754,8 +764,56 @@ await adminMessaging.sendEachForMulticast({
 * **Android 13+ (API 33) Runtime Permission**: The browser automatically requests the system `POST_NOTIFICATIONS` runtime permission when `Notification.requestPermission()` is resolved.
 * **Heads-Up Notifications**: Ensure notification priority is high so notifications pop over active apps.
 
-### Windows & macOS Desktop
-* **System Focus Assist / Do Not Disturb**: If desktop banners do not appear while the browser is in the background, check that Windows "Focus Assist" / "Do Not Disturb" is turned off, and verify that notifications are enabled for Google Chrome / Microsoft Edge in **Windows Settings &rarr; System &rarr; Notifications**.
+### Windows & macOS Desktop (Closed Browser & Background Delivery)
+
+#### Why Notifications Queue When the Browser/App is Completely Closed:
+Unlike mobile platforms (Android has Google Play Services and iOS has APNs running 24/7 at the OS kernel level), desktop operating systems **do not have a native push daemon for web apps**. 
+
+Instead, the **host browser engine (Google Chrome or Microsoft Edge) is itself the push client**.
+* **When Chrome or the desktop PWA is closed with no background worker running**, the network socket to Google FCM (`mtalk.google.com:5228`) is severed.
+* Firebase Cloud Messaging securely **queues** the notification in the cloud.
+* The moment Chrome or the PWA window is launched, the socket reconnects, retrieves all queued messages, and your Service Worker instantly displays the notification toast.
+
+#### Why "Continue running background apps when closed" Might Still Not Deliver When Closed:
+Even if `chrome://settings/system` has **"Continue running background apps when Google Chrome is closed"** toggled ON, Chrome will only keep a background daemon alive if at least one installed extension or app explicitly registered a persistent background worker.
+
+* **System Tray Verification**:
+  1. Close all Chrome windows and close your desktop PWA.
+  2. Click the `^` arrow next to your Windows clock in the system tray.
+  3. If there is **no Chrome icon**, Chrome has fully exited from memory and closed the push socket.
+  4. If the Chrome icon is present (*"Google Chrome is running in the background"*), the push socket is active and will receive pushes.
+
+#### Setting High Urgency in FCM WebPush Payload:
+By default, the Web Push Protocol assigns `normal` urgency to push messages. Chromium's power management can defer waking Service Workers for normal-priority messages until the browser window is focused.
+
+To force immediate Service Worker wake-up and keep the toast visible on desktop:
+```typescript
+webpush: {
+  headers: {
+    Urgency: "high", // 'very-low' | 'low' | 'normal' | 'high'
+  },
+  notification: {
+    icon: "/favicon.ico",
+    badge: "/favicon.ico",
+    requireInteraction: true, // Desktop toast stays visible until the user dismisses it
+  },
+}
+```
+
+#### Windows Action Center & Focus Assist / Do Not Disturb:
+Windows 10/11 frequently captures background notifications and silently deposits them into the Windows Action Center without popping up a toast banner:
+1. Press **`Win + N`** to inspect the Windows Notification panel and check if the notification arrived silently.
+2. In **Windows Settings &rarr; System &rarr; Notifications &rarr; Google Chrome**:
+   * Verify **"Show notification banners"** is checked.
+   * Verify **"Show notifications in notification center"** is checked.
+   * Set priority to **"Top"** or **"High"**.
+3. Ensure Windows **"Do Not Disturb"** (bell icon in taskbar) is turned **OFF**.
+
+#### Diagnostic Test (PWA Closed vs. Chrome Open):
+To verify that your PWA receives background notifications:
+1. Leave a normal Chrome window open (e.g., on `google.com`), but **close your installed desktop PWA window**.
+2. Dispatch a notification to your email.
+3. Because the Chrome process is active, Windows will pop up the desktop notification toast for your PWA immediately, and clicking it will launch/focus the PWA.
 
 ---
 
