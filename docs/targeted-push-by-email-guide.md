@@ -26,16 +26,26 @@ Firebase Cloud Messaging (FCM) routes notifications using **Device Registration 
 
 ## End-to-End Implementation Roadmap
 
-* **Step 1: Set Up Firebase Admin SDK & Service Account Credentials (Detailed Below)**  
+* **Step 1: Set Up Firebase Admin SDK & Service Account Credentials**  
   Install `firebase-admin`, download service account credentials from Firebase Console, store them in `.env.local`, and create a server singleton.
 * **Step 2: Create a Token Store (Email &rarr; Device Tokens Mapping)**  
-  Set up storage (database or local in-memory/JSON store) to maintain device tokens for each email.
+  Set up storage (Drizzle ORM + PostgreSQL) to maintain device tokens for each email.
 * **Step 3: Update the Frontend to Register User Email & Token**  
   Call the registration API whenever a user logs in or enables push notifications.
 * **Step 4: Create the Backend Dispatch Route Handler (`/api/notifications/send`)**  
-  Build the API endpoint that takes `{ targetEmail, title, body }`, looks up tokens, and dispatches via Firebase Admin.
+  Build the API endpoint that takes `{ targetEmail, title, body, actionUrl }`, looks up tokens, and dispatches via Firebase Admin.
 * **Step 5: Create a Test Sender UI & Verify Delivery**  
-  Add a UI form to test sending targeted notifications to any email and observe delivery.
+  Add a UI form (`SendNotificationForm`) to test sending targeted notifications to any email and observe delivery.
+* **Step 6: Token Unregistration on User Logout**  
+  Unregister device tokens in the database and invalidate with Google FCM when users log out.
+* **Step 7: Background Notification Action URL Routing & Deep Linking**  
+  Handle background click events in `firebase-messaging-sw.js` to route users directly to `actionUrl`.
+* **Step 8: In-App Notification Center / Inbox Bell**  
+  Display the persistent notification history stored in PostgreSQL with unread badges and mark-as-read controls.
+* **Step 9: User Notification Preferences & Categorization**  
+  Allow users to opt into or out of specific notification categories (e.g., transactional, marketing, updates).
+* **Step 10: PWA Offline Fallback Experience**  
+  Provide a dedicated offline page when the user loses internet connectivity.
 
 ---
 
@@ -749,7 +759,7 @@ await adminMessaging.sendEachForMulticast({
 
 ---
 
-## User Logout & Token Lifecycle Management
+## Step 6: User Logout & Token Lifecycle Management
 
 ### Does a User Still Receive Notifications After Logging Out?
 
@@ -772,11 +782,9 @@ If User A logs out on a shared or public computer (e.g. library, internet cafe, 
 
 ---
 
-### How to Implement Token Unregistration on Logout
+### Implementing Token Unregistration on Logout
 
-To ensure notifications stop immediately when a user logs out, implement an unregistration pipeline:
-
-#### 1. Create the Unregister Route Handler (`app/api/notifications/unregister-token/route.ts`)
+#### 6.1 Create the Unregister Route Handler (`app/api/notifications/unregister-token/route.ts`)
 
 Create `app/api/notifications/unregister-token/route.ts` to purge the device token from the database:
 
@@ -789,7 +797,8 @@ import { deviceTokens } from "@/lib/schema";
 
 export async function POST(request: Request) {
   try {
-    const { token } = await request.json();
+    const body = await request.json();
+    const { token } = body;
 
     if (!token) {
       return NextResponse.json(
@@ -807,59 +816,58 @@ export async function POST(request: Request) {
   } catch (error: any) {
     console.error("Error unregistering token:", error);
     return NextResponse.json(
-      { error: error.message || "Failed to unregister token" },
+      { error: error?.message || "Failed to unregister token" },
       { status: 500 }
     );
   }
 }
 ```
 
-#### 2. Update the Client Logout Flow (`components/LogoutButton.tsx`)
+#### 6.2 Update the Client Logout Flow (`components/LogoutButton.tsx`)
 
-In your logout handler, perform two cleanup tasks before clearing the NextAuth session:
+In your logout handler, perform three cleanup tasks:
 1. Delete the token from your database (`/api/notifications/unregister-token`).
-2. Revoke the token from Google's FCM servers using `deleteToken(messaging)`:
+2. Revoke the token from Google's FCM servers using `deleteToken(messaging)`.
+3. Clear `localStorage` and sign out:
 
 ```tsx
 // components/LogoutButton.tsx
 "use client";
 
 import { useState } from "react";
-import { signOut } from "next-auth/react";
+import { signOut, useSession } from "next-auth/react";
 import { deleteToken } from "firebase/messaging";
 import { getClientMessaging } from "@/lib/firebase";
 
 export function LogoutButton() {
+  const { data: session } = useSession();
   const [loading, setLoading] = useState(false);
 
   const handleLogout = async () => {
     setLoading(true);
+    const storageKey = `fcmToken_${session?.user?.name || "current"}`;
+    const currentToken = localStorage.getItem(storageKey);
+
     try {
-      // 1. Invalidate with Firebase and retrieve the token to unregister
-      const messaging = await getClientMessaging();
-      if (messaging) {
-        // Attempt to unregister from our database before revoking from Google
-        const registration = await navigator.serviceWorker.ready;
-        const currentToken = await registration.pushManager
-          .getSubscription()
-          .then((sub) => sub ? sub.endpoint : null);
+      if (currentToken) {
+        // 1. Remove from database
+        await fetch("/api/notifications/unregister-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: currentToken }),
+        });
 
-        // Or pass the known token stored in state/storage
-        if (currentToken) {
-          await fetch("/api/notifications/unregister-token", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ token: currentToken }),
-          });
+        // 2. Invalidate with Google FCM
+        const messaging = await getClientMessaging();
+        if (messaging) {
+          await deleteToken(messaging);
         }
-
-        // Revoke the token on Google FCM servers
-        await deleteToken(messaging);
       }
     } catch (err) {
       console.error("Error cleaning up push token on logout:", err);
     } finally {
-      // 2. Clear NextAuth session and redirect
+      // 3. Purge storage and clear session
+      localStorage.removeItem(storageKey);
       await signOut({ callbackUrl: "/login" });
       setLoading(false);
     }
@@ -876,3 +884,345 @@ export function LogoutButton() {
   );
 }
 ```
+
+---
+
+## Step 7: Background Notification Action URL Routing & Deep-Linking
+
+When the application is closed or in the background, clicking an operating system notification triggers the `notificationclick` event in `public/firebase-messaging-sw.js`.
+
+### 7.1 Align Payload Property Names
+In `app/api/notifications/send/route.ts`, the dispatch route sends:
+```typescript
+data: {
+  actionUrl: actionUrl, // e.g. "/orders/123"
+  sentAt: new Date().toISOString(),
+}
+```
+Ensure `public/firebase-messaging-sw.js` reads `payloadData?.actionUrl || payloadData?.url || "/"`:
+
+```javascript
+// public/firebase-messaging-sw.js
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const payloadData = event.notification.data || {};
+  const targetUrl = payloadData.actionUrl || payloadData.url || "/";
+
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((clientsArr) => {
+        // 1. If an existing window is open at the same origin, focus it and navigate
+        for (const client of clientsArr) {
+          if (client.url.startsWith(self.location.origin)) {
+            client.postMessage({
+              type: "FCM_ACTION",
+              payload: payloadData,
+            });
+            client.navigate(targetUrl);
+            return client.focus();
+          }
+        }
+        // 2. Otherwise open a new window to the target URL
+        return self.clients.openWindow(targetUrl);
+      })
+  );
+});
+```
+
+---
+
+## Step 8: In-App Notification Center / Inbox Bell
+
+Because `app/api/notifications/send/route.ts` records every message into the PostgreSQL `notifications` table, you can give users a persistent notification center in your header.
+
+### 8.1 Create Notifications Fetch Route (`app/api/notifications/route.ts`)
+
+```typescript
+// app/api/notifications/route.ts
+import { NextResponse } from "next/server";
+import { auth } from "@/auth";
+import { db } from "@/lib/connection";
+import { notifications, users } from "@/lib/schema";
+import { eq, desc } from "drizzle-orm";
+
+export async function GET() {
+  const session = await auth();
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const [user] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.email, session.user.email))
+    .limit(1);
+
+  if (!user) {
+    return NextResponse.json({ error: "User not found" }, { status: 404 });
+  }
+
+  const userNotifications = await db
+    .select()
+    .from(notifications)
+    .where(eq(notifications.userId, user.id))
+    .orderBy(desc(notifications.createdAt))
+    .limit(30);
+
+  return NextResponse.json({ notifications: userNotifications });
+}
+```
+
+### 8.2 Mark as Read Endpoint (`app/api/notifications/[id]/read/route.ts`)
+
+```typescript
+// app/api/notifications/[id]/read/route.ts
+import { NextResponse } from "next/server";
+import { auth } from "@/auth";
+import { db } from "@/lib/connection";
+import { notifications } from "@/lib/schema";
+import { eq } from "drizzle-orm";
+
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const session = await auth();
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { id } = await params;
+
+  await db
+    .update(notifications)
+    .set({ isRead: true })
+    .where(eq(notifications.id, id));
+
+  return NextResponse.json({ success: true });
+}
+```
+
+### 8.3 Notification Bell Component (`components/NotificationBell.tsx`)
+
+A bell icon with an unread badge that opens a dropdown popover:
+
+```tsx
+// components/NotificationBell.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import Link from "next/link";
+
+interface NotificationItem {
+  id: string;
+  title: string;
+  body: string;
+  actionUrl: string | null;
+  isRead: boolean;
+  createdAt: string;
+}
+
+export function NotificationBell() {
+  const [items, setItems] = useState<NotificationItem[]>([]);
+  const [open, setOpen] = useState(false);
+
+  const fetchNotifications = async () => {
+    try {
+      const res = await fetch("/api/notifications");
+      if (res.ok) {
+        const data = await res.json();
+        setItems(data.notifications || []);
+      }
+    } catch (err) {
+      console.error("Failed to load notifications:", err);
+    }
+  };
+
+  useEffect(() => {
+    fetchNotifications();
+  }, []);
+
+  const unreadCount = items.filter((n) => !n.isRead).length;
+
+  const markAsRead = async (id: string) => {
+    await fetch(`/api/notifications/${id}/read`, { method: "PATCH" });
+    setItems((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
+    );
+  };
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        className="relative p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+        aria-label="Notifications"
+      >
+        <svg
+          className="w-5 h-5 text-zinc-700 dark:text-zinc-300"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="2"
+            d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
+          />
+        </svg>
+        {unreadCount > 0 && (
+          <span className="absolute top-1 right-1 flex items-center justify-center w-4 h-4 text-[10px] font-bold text-white bg-rose-600 rounded-full">
+            {unreadCount > 9 ? "9+" : unreadCount}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="absolute right-0 mt-2 w-80 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg shadow-xl z-50 overflow-hidden">
+          <div className="p-3 border-b border-zinc-200 dark:border-zinc-800 flex justify-between items-center">
+            <span className="text-sm font-semibold">Notifications</span>
+            {unreadCount > 0 && (
+              <span className="text-xs text-zinc-500">{unreadCount} unread</span>
+            )}
+          </div>
+
+          <div className="max-h-72 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-800">
+            {items.length === 0 ? (
+              <p className="p-4 text-xs text-center text-zinc-500">
+                No notifications yet.
+              </p>
+            ) : (
+              items.map((item) => (
+                <div
+                  key={item.id}
+                  className={`p-3 text-xs transition-colors ${
+                    item.isRead
+                      ? "bg-transparent text-zinc-500"
+                      : "bg-blue-50/50 dark:bg-blue-950/20 text-zinc-800 dark:text-zinc-200"
+                  }`}
+                >
+                  <p className="font-semibold">{item.title}</p>
+                  <p className="mt-0.5">{item.body}</p>
+                  <div className="mt-2 flex items-center justify-between">
+                    {item.actionUrl ? (
+                      <Link
+                        href={item.actionUrl}
+                        onClick={() => markAsRead(item.id)}
+                        className="text-blue-600 dark:text-blue-400 hover:underline"
+                      >
+                        View &rarr;
+                      </Link>
+                    ) : (
+                      <span />
+                    )}
+                    {!item.isRead && (
+                      <button
+                        onClick={() => markAsRead(item.id)}
+                        className="text-[11px] text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
+                      >
+                        Mark as read
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+Mount `<NotificationBell />` inside `components/Header.tsx` next to your user greeting and logout button.
+
+---
+
+## Step 9: User Notification Preferences & Filtering
+
+Using the `notificationPreferences` table defined in `lib/schema.ts`:
+
+```typescript
+export const notificationPreferences = pgTable("notification_preferences", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  type: text("type").notNull(), // 'marketing' | 'orders' | 'security'
+  enabled: boolean("enabled").notNull().default(true),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+});
+```
+
+### 9.1 Filter Before Dispatching Push
+In `app/api/notifications/send/route.ts`, accept an optional `category` (e.g., `'marketing'`) and verify the recipient hasn't disabled it:
+
+```typescript
+// Inside app/api/notifications/send/route.ts:
+const { targetEmail, title, body: messageBody, category = "transactional" } = body;
+
+// Check user preferences
+const [pref] = await db
+  .select({ enabled: notificationPreferences.enabled })
+  .from(notificationPreferences)
+  .where(
+    and(
+      eq(notificationPreferences.userId, user.id),
+      eq(notificationPreferences.type, category)
+    )
+  )
+  .limit(1);
+
+if (pref && !pref.enabled) {
+  return NextResponse.json(
+    { message: `User has muted "${category}" notifications. Skipped delivery.` },
+    { status: 200 }
+  );
+}
+```
+
+---
+
+## Step 10: PWA Offline Fallback Experience
+
+To guarantee offline PWA capabilities when internet connectivity is lost:
+
+### 10.1 Create `app/offline/page.tsx`
+
+```tsx
+// app/offline/page.tsx
+export default function OfflinePage() {
+  return (
+    <div className="flex flex-col items-center justify-center min-h-[60vh] p-6 text-center">
+      <div className="p-4 bg-zinc-100 dark:bg-zinc-800 rounded-full mb-4">
+        <svg
+          className="w-10 h-10 text-zinc-500"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="2"
+            d="M18.364 5.636a9 9 0 010 12.728m0 0l-2.829-2.828m2.829 2.828L21 21M15.536 8.464a5 5 0 010 7.072m0 0l-2.829-2.829m-4.243 4.243a9 9 0 01-12.728 0m0 0l2.829-2.828m-2.829 2.828L3 21m2.828-5.464a5 5 0 010-7.072m0 0l2.829 2.829"
+          />
+        </svg>
+      </div>
+      <h1 className="text-2xl font-bold mb-2">You are currently offline</h1>
+      <p className="text-sm text-zinc-600 dark:text-zinc-400 max-w-sm mb-6">
+        Please check your network connection. Any notifications dispatched to you will be delivered as soon as you reconnect.
+      </p>
+      <button
+        onClick={() => window.location.reload()}
+        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium transition-colors"
+      >
+        Retry Connection
+      </button>
+    </div>
+  );
+}
+```
+
+Configure `next.config.ts` with `fallbacks: { document: "/offline" }` under `withPWAInit` so `next-pwa` serves this page automatically whenever network requests fail.

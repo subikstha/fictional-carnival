@@ -41,6 +41,8 @@ export function LogoutButton() {
     } catch (err) {
       console.error("Error cleaning up push token on logout:", err);
     } finally {
+      // Clear saved token from localStorage
+      localStorage.removeItem(`fcmToken_${sessionData?.user?.name}`);
       // 2. Clear NextAuth session and redirect
       await signOut({ callbackUrl: "/login" });
       setLoading(false);
