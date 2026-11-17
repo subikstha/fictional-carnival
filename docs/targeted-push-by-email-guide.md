@@ -122,31 +122,130 @@ export default admin;
 
 ---
 
-## Upcoming Steps Preview
+## Step 2: Create the Token Store & Registration Endpoint
 
-### Step 2 Preview: Token Store
-Create an abstraction (e.g. database table or in-memory map for dev) mapping:
-```json
-{
-  "user@example.com": [
-    "fcm_token_laptop_123...",
-    "fcm_token_phone_456..."
-  ]
+Now that `firebase-admin` is set up, the database needs to store and map user accounts to their device tokens.
+
+### 2.1 Schema Architecture (`lib/schema.ts`)
+Using Drizzle ORM and PostgreSQL, the `deviceTokens` table is defined as:
+
+```typescript
+// lib/schema.ts
+export const deviceTokens = pgTable(
+  "device_tokens",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    token: text("token").notNull().unique(),
+    deviceType: text("device_type").notNull().default("web"),
+    app: text("app").notNull().default("trialapp"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [index("device_tokens_user_id_idx").on(table.userId)]
+);
+```
+
+#### Why This Schema Design Matters:
+* **`token.unique()` (Crucial)**: Guarantees that if User B logs into a browser or phone previously used by User A, the FCM token is **reassigned** to User B via an upsert. This completely prevents User A from receiving notifications intended for User B.
+* **`onDelete: "cascade"`**: If a user is deleted from the `users` table, all their registered device tokens are automatically purged.
+* **Index on `userId`**: Ensures rapid lookups when sending notifications to a user across multiple devices (`SELECT token FROM device_tokens WHERE user_id = ?`).
+
+---
+
+### 2.2 Token Registration Route Handler (`app/api/notifications/register-token/route.ts`)
+
+Create or update `app/api/notifications/register-token/route.ts`. This endpoint finds the user by their email, and then **upserts** (`onConflictDoUpdate`) the device token:
+
+```typescript
+// app/api/notifications/register-token/route.ts
+import { NextResponse } from "next/server";
+import { eq } from "drizzle-orm";
+import { db } from "@/lib/connection";
+import { deviceTokens, users } from "@/lib/schema";
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const { email, token, deviceType = "web" } = body;
+
+    if (!email || !token) {
+      return NextResponse.json(
+        { error: "Email and token are required" },
+        { status: 400 }
+      );
+    }
+
+    // 1. Look up user by email
+    const [user] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, email))
+      .limit(1);
+
+    if (!user) {
+      return NextResponse.json(
+        { error: `User with email ${email} not found` },
+        { status: 404 }
+      );
+    }
+
+    // 2. Upsert the device token:
+    // If the token already exists (e.g. account switch), reassign it to this user!
+    await db
+      .insert(deviceTokens)
+      .values({
+        userId: user.id,
+        token: token,
+        deviceType: deviceType,
+      })
+      .onConflictDoUpdate({
+        target: deviceTokens.token,
+        set: {
+          userId: user.id,
+          deviceType: deviceType,
+          updatedAt: new Date(),
+        },
+      });
+
+    return NextResponse.json({
+      success: true,
+      message: `Token registered successfully for ${email}`,
+    });
+  } catch (error: any) {
+    console.error("Error registering device token:", error);
+    return NextResponse.json(
+      { error: error.message || "Failed to register token" },
+      { status: 500 }
+    );
+  }
 }
 ```
 
+---
+
+## Upcoming Steps Preview
+
 ### Step 3 Preview: Client Registration
-In `PushManager.tsx`:
+In `PushManager.tsx`, send the token along with the logged-in user's email:
 ```typescript
 await fetch("/api/notifications/register-token", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ email: user.email, token: currentToken }),
+  body: JSON.stringify({ email: currentUser.email, token: currentToken }),
 });
 ```
 
 ### Step 4 Preview: Dispatch Route Handler
 In `app/api/notifications/send/route.ts`:
+Query the user's tokens using their email address, then dispatch:
 ```typescript
 const tokens = await getTokensByEmail(targetEmail);
 await adminMessaging.sendEachForMulticast({

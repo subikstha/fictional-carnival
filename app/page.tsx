@@ -1,4 +1,5 @@
 import { PushManager } from "@/components/PushManager";
+import PushManagerWrapper from "@/components/PushManagerWrapper";
 import Image from "next/image";
 
 export default function Home() {
@@ -64,7 +65,8 @@ export default function Home() {
             Documentation
           </a>
         </div> */}
-        <PushManager />
+        <PushManagerWrapper />
+        {/* <PushManager /> */}
       </main>
     </div>
   );
