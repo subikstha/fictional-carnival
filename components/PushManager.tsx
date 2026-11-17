@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { getToken, onMessage } from "firebase/messaging";
 import { getClientMessaging } from "@/lib/firebase";
+import { SendNotificationForm } from "./SendNotificationForm";
 
 export function PushManager({ email }: { email: string }) {
   const [token, setToken] = useState<string | null>(null);
@@ -115,49 +116,53 @@ export function PushManager({ email }: { email: string }) {
   };
 
   return (
-    <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900 max-w-md my-4">
-      <h2 className="text-lg font-semibold mb-2">Push Notifications</h2>
-      <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
-        Status: <span className="font-medium">{permission}</span>
-      </p>
+    <div className="w-full max-w-md my-4 space-y-6">
+      <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900">
+        <h2 className="text-lg font-semibold mb-2">Push Notifications</h2>
+        <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
+          Status: <span className="font-medium">{permission}</span>
+        </p>
 
-      {permission !== "granted" ? (
-        <button
-          onClick={handleSubscribe}
-          className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
-        >
-          Enable Notifications
-        </button>
-      ) : (
-        <div>
-          <p className="text-xs text-green-600 dark:text-green-400 font-semibold mb-2">
-            ✓ Push notifications enabled
-          </p>
-          {token && !loading && (
-            <div className="mt-2">
-              <label className="text-xs text-zinc-500 block mb-1">
-                Your FCM Token (for testing):
-              </label>
-              <textarea
-                readOnly
-                value={token}
-                rows={3}
-                className="w-full text-xs p-2 font-mono bg-white dark:bg-black border rounded"
-                onClick={(e) => (e.target as HTMLTextAreaElement).select()}
-              />
-            </div>
-          )}
-        </div>
-      )}
+        {permission !== "granted" ? (
+          <button
+            onClick={handleSubscribe}
+            className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
+          >
+            Enable Notifications
+          </button>
+        ) : (
+          <div>
+            <p className="text-xs text-green-600 dark:text-green-400 font-semibold mb-2">
+              ✓ Push notifications enabled
+            </p>
+            {token && !loading && (
+              <div className="mt-2">
+                <label className="text-xs text-zinc-500 block mb-1">
+                  Your FCM Token (for testing):
+                </label>
+                <textarea
+                  readOnly
+                  value={token}
+                  rows={3}
+                  className="w-full text-xs p-2 font-mono bg-white dark:bg-black border rounded"
+                  onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
-      {notification && (
-        <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 rounded">
-          <p className="font-semibold text-sm">{notification.title}</p>
-          <p className="text-xs text-zinc-600 dark:text-zinc-300">
-            {notification.body}
-          </p>
-        </div>
-      )}
+        {notification && (
+          <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 rounded">
+            <p className="font-semibold text-sm">{notification.title}</p>
+            <p className="text-xs text-zinc-600 dark:text-zinc-300">
+              {notification.body}
+            </p>
+          </div>
+        )}
+      </div>
+
+      <SendNotificationForm defaultTargetEmail={email} />
     </div>
   );
 }

@@ -231,25 +231,379 @@ export async function POST(request: Request) {
 
 ---
 
-## Upcoming Steps Preview
+## Step 3: Client Token Registration (`PushManager.tsx`)
 
-### Step 3 Preview: Client Registration
-In `PushManager.tsx`, send the token along with the logged-in user's email:
+In `components/PushManager.tsx`, as soon as the FCM token is retrieved and the user's email is available from the session, send both to the registration endpoint:
+
 ```typescript
-await fetch("/api/notifications/register-token", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ email: currentUser.email, token: currentToken }),
-});
+// Inside components/PushManager.tsx:
+const registerTokenOnBackend = async (currentToken: string, userEmail: string) => {
+  try {
+    await fetch("/api/notifications/register-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: userEmail,
+        token: currentToken,
+        deviceType: "web",
+      }),
+    });
+    console.log("Token registered on backend for", userEmail);
+  } catch (err) {
+    console.error("Failed to register token on backend:", err);
+  }
+};
 ```
 
-### Step 4 Preview: Dispatch Route Handler
-In `app/api/notifications/send/route.ts`:
-Query the user's tokens using their email address, then dispatch:
+---
+
+## Step 4: Backend Notification Dispatcher (`/api/notifications/send`)
+
+The dispatch route handler accepts `{ targetEmail, title, body, actionUrl }`, finds all active device tokens for that email, sends the push to all devices, prunes invalid tokens, and records the notification in the database inbox.
+
+Create `app/api/notifications/send/route.ts`:
+
 ```typescript
-const tokens = await getTokensByEmail(targetEmail);
-await adminMessaging.sendEachForMulticast({
-  tokens,
-  notification: { title, body },
-});
+// app/api/notifications/send/route.ts
+import { NextResponse } from "next/server";
+import { eq, inArray } from "drizzle-orm";
+import { db } from "@/lib/connection";
+import { users, deviceTokens, notifications } from "@/lib/schema";
+import { adminMessaging } from "@/lib/firebase-admin";
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const { targetEmail, title, body: messageBody, actionUrl = "/" } = body;
+
+    // 1. Validate inputs
+    if (!targetEmail || !title || !messageBody) {
+      return NextResponse.json(
+        { error: "targetEmail, title, and body are required." },
+        { status: 400 }
+      );
+    }
+
+    // 2. Find user by email
+    const [user] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, targetEmail.trim().toLowerCase()))
+      .limit(1);
+
+    if (!user) {
+      return NextResponse.json(
+        { error: `User with email "${targetEmail}" was not found.` },
+        { status: 404 }
+      );
+    }
+
+    // 3. Retrieve all device tokens registered to this user
+    const tokenRecords = await db
+      .select({ token: deviceTokens.token })
+      .from(deviceTokens)
+      .where(eq(deviceTokens.userId, user.id));
+
+    if (!tokenRecords.length) {
+      return NextResponse.json(
+        {
+          error: "User has no registered devices. They must log in and enable notifications first.",
+        },
+        { status: 404 }
+      );
+    }
+
+    const tokens = tokenRecords.map((r) => r.token);
+
+    // 4. Dispatch the push notification to all devices
+    const response = await adminMessaging.sendEachForMulticast({
+      tokens: tokens,
+      notification: {
+        title: title,
+        body: messageBody,
+      },
+      data: {
+        actionUrl: actionUrl,
+        sentAt: new Date().toISOString(),
+      },
+    });
+
+    // 5. Clean up stale/invalid tokens reported by Firebase
+    const deadTokens: string[] = [];
+    response.responses.forEach((res, idx) => {
+      if (!res.success) {
+        const errCode = res.error?.code;
+        if (
+          errCode === "messaging/registration-token-not-registered" ||
+          errCode === "messaging/invalid-registration-token"
+        ) {
+          deadTokens.push(tokens[idx]);
+        }
+      }
+    });
+
+    if (deadTokens.length > 0) {
+      await db
+        .delete(deviceTokens)
+        .where(inArray(deviceTokens.token, deadTokens));
+      console.log(`Cleaned up ${deadTokens.length} expired token(s)`);
+    }
+
+    // 6. Save in the in-app notification inbox
+    await db.insert(notifications).values({
+      userId: user.id,
+      title: title,
+      body: messageBody,
+      actionUrl: actionUrl,
+    });
+
+    return NextResponse.json({
+      success: true,
+      deliveredToDevices: response.successCount,
+      failedDevices: response.failureCount,
+    });
+  } catch (error: any) {
+    console.error("Error dispatching notification:", error);
+    return NextResponse.json(
+      { error: error.message || "Failed to send notification" },
+      { status: 500 }
+    );
+  }
+}
 ```
+
+---
+
+## Step 5: Test Sender UI Component & Verification
+
+Now that the `/api/notifications/send` route handler is created, build a test UI component so you can trigger targeted push notifications directly from the browser to any registered user email.
+
+### 5.1 Create `components/SendNotificationForm.tsx`
+
+Create `components/SendNotificationForm.tsx`:
+
+```tsx
+"use client";
+
+import { useState } from "react";
+
+export function SendNotificationForm() {
+  const [targetEmail, setTargetEmail] = useState("");
+  const [title, setTitle] = useState("Hello from Next.js! 🚀");
+  const [body, setBody] = useState("This is a targeted push notification sent by email.");
+  const [actionUrl, setActionUrl] = useState("/");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<{
+    success?: boolean;
+    deliveredToDevices?: number;
+    failedDevices?: number;
+    error?: string;
+  } | null>(null);
+
+  const handleSend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setResult(null);
+
+    try {
+      const res = await fetch("/api/notifications/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          targetEmail: targetEmail.trim().toLowerCase(),
+          title,
+          body,
+          actionUrl,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setResult({ error: data.error || "Failed to send notification." });
+      } else {
+        setResult({
+          success: true,
+          deliveredToDevices: data.deliveredToDevices,
+          failedDevices: data.failedDevices,
+        });
+      }
+    } catch (err: any) {
+      setResult({ error: err.message || "Network error occurred." });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900 max-w-md w-full my-4">
+      <h2 className="text-lg font-semibold mb-3">Send Push Notification</h2>
+      <p className="text-xs text-zinc-500 mb-4">
+        Dispatch a push notification to all active devices registered under a specific user email.
+      </p>
+
+      <form onSubmit={handleSend} className="space-y-3">
+        <div>
+          <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            Recipient User Email
+          </label>
+          <input
+            type="email"
+            required
+            placeholder="user@example.com"
+            value={targetEmail}
+            onChange={(e) => setTargetEmail(e.target.value)}
+            className="w-full text-sm p-2 border rounded bg-white dark:bg-black border-zinc-300 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            Notification Title
+          </label>
+          <input
+            type="text"
+            required
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="w-full text-sm p-2 border rounded bg-white dark:bg-black border-zinc-300 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            Notification Body
+          </label>
+          <textarea
+            required
+            rows={2}
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            className="w-full text-sm p-2 border rounded bg-white dark:bg-black border-zinc-300 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+            Action URL (on click)
+          </label>
+          <input
+            type="text"
+            value={actionUrl}
+            onChange={(e) => setActionUrl(e.target.value)}
+            className="w-full text-sm p-2 border rounded bg-white dark:bg-black border-zinc-300 dark:border-zinc-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full py-2 px-4 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-sm font-medium rounded transition-colors"
+        >
+          {loading ? "Dispatching..." : "Send Notification"}
+        </button>
+      </form>
+
+      {result?.success && (
+        <div className="mt-4 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 rounded text-xs text-emerald-800 dark:text-emerald-200">
+          <p className="font-semibold">✓ Notification dispatched!</p>
+          <p>Delivered to {result.deliveredToDevices} device(s).</p>
+          {result.failedDevices! > 0 && (
+            <p className="text-amber-600 dark:text-amber-400">
+              Failed for {result.failedDevices} stale device(s) (cleaned from DB).
+            </p>
+          )}
+        </div>
+      )}
+
+      {result?.error && (
+        <div className="mt-4 p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-300 dark:border-rose-800 rounded text-xs text-rose-800 dark:text-rose-200">
+          <p className="font-semibold">✕ Send failed:</p>
+          <p>{result.error}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+### 5.2 Mount the Form in `components/PushManagerWrapper.tsx`
+
+Render `<SendNotificationForm />` alongside `<PushManager />` so authenticated users can test dispatching:
+
+```tsx
+// components/PushManagerWrapper.tsx
+import { auth } from "@/auth";
+import { PushManager } from "./PushManager";
+import { SendNotificationForm } from "./SendNotificationForm";
+import Link from "next/link";
+
+const PushManagerWrapper = async () => {
+  const session = await auth();
+
+  return session ? (
+    <div className="flex flex-col gap-6 w-full max-w-md">
+      <PushManager email={session.user?.email as string} />
+      <SendNotificationForm />
+    </div>
+  ) : (
+    <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900 max-w-md">
+      <h1 className="text-lg font-semibold mb-2">Please login first</h1>
+      <Link
+        href="/login"
+        className="inline-block px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
+      >
+        Login
+      </Link>
+    </div>
+  );
+};
+
+export default PushManagerWrapper;
+```
+
+---
+
+### 5.3 How to Test & What to Expect
+
+Follow these steps to verify both foreground and background push notification behaviors:
+
+#### Scenario A: Self-Test (Single Browser)
+1. Open your browser to `http://localhost:3000` and log in with User A (`user1@example.com`).
+2. Click **"Enable Notifications"** and approve the browser prompt.
+3. Check the console and the database: the FCM device token is registered for `user1@example.com`.
+4. In the **Send Push Notification** form, enter `user1@example.com` as the recipient.
+5. Click **"Send Notification"**:
+   - **Foreground test (tab is open & focused)**: Firebase client SDK receives `onMessage` &rarr; `<PushManager />` displays the blue notification banner on the screen.
+   - **Background test (minimize or switch to another tab)**: Send the notification or wait for one while the tab is blurred/minimized &rarr; the Service Worker (`firebase-messaging-sw.js`) intercepts the push and Windows/macOS shows an OS desktop notification. Clicking it focuses your tab and navigates to `actionUrl`.
+
+#### Scenario B: Multi-Device / Multi-User Test
+1. Open **Chrome** and log in as `alice@example.com`. Allow notifications.
+2. Open **Edge** (or Chrome Incognito) and log in as `bob@example.com`. Allow notifications.
+3. In Alice's window, set the recipient email to `bob@example.com` and click **"Send Notification"**.
+4. Observe:
+   - Alice's screen displays: `Delivered to 1 device(s)`.
+   - Bob's browser/OS receives the notification in real time.
+   - Alice receives nothing (strictly targeted to Bob).
+
+---
+
+## Important Production Notes & Pitfalls
+
+> [!WARNING]
+> **Check Imports in `app/api/notifications/send/route.ts`**:
+> Ensure that both `inArray` from `"drizzle-orm"` and `notifications` from `@/lib/schema` are properly imported:
+> ```typescript
+> import { eq, inArray } from "drizzle-orm";
+> import { deviceTokens, users, notifications } from "@/lib/schema";
+> ```
+> Omitting these will throw a runtime `ReferenceError` when stale tokens are cleaned up or when notifications are inserted into the inbox.
+
+> [!NOTE]
+> **Automatic Token Pruning**:
+> When Firebase returns `messaging/registration-token-not-registered` or `messaging/invalid-registration-token`, the recipient has either uninstalled the PWA, revoked notification permissions, or cleared browser site data. The cleanup code in Step 4 automatically deletes those dead tokens from `deviceTokens`, preventing wasted multicast quota on future sends.
+
+> [!TIP]
+> **Shared Computers & Multi-User Token Reassignment**:
+> Because `deviceTokens.token` is marked `.unique()`, if Bob logs into the same physical browser profile where Alice previously logged in, the `onConflictDoUpdate` clause in Step 2 updates `userId = bob.id`. Alice will no longer receive Bob's notifications on that device.
