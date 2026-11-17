@@ -94,30 +94,50 @@ FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFA
 
 ### 1.4 Create the Server Singleton (`lib/firebase-admin.ts`)
 
-Create `lib/firebase-admin.ts`. This ensures Firebase Admin initializes only once across hot reloads and Next.js serverless invocations:
+Create `lib/firebase-admin.ts`. In modern versions of `firebase-admin` (v12+ / v14) and Next.js ESM / Webpack bundles, initialize using the modular `firebase-admin/app` and `firebase-admin/messaging` subpaths. 
+
+Using a **lazy Proxy** pattern is strongly recommended for Next.js: it prevents eager top-level initialization from failing or throwing `The default Firebase app does not exist` during `next build` worker data collection:
 
 ```typescript
 // lib/firebase-admin.ts
-import admin from "firebase-admin";
+import { initializeApp, getApps, getApp, cert, App } from "firebase-admin/app";
+import { getMessaging, Messaging } from "firebase-admin/messaging";
 
-if (!admin.apps.length) {
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        // Replace escaped newlines with actual newline characters
-        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
-      }),
-    });
-    console.log("✅ Firebase Admin initialized successfully");
-  } catch (error) {
-    console.error("❌ Firebase Admin initialization error:", error);
+function getAdminApp(): App {
+  if (getApps().length > 0) {
+    return getApp();
   }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+
+  if (!projectId || !clientEmail || !privateKey) {
+    throw new Error(
+      "Firebase Admin credentials missing: ensure FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY are set in .env.local"
+    );
+  }
+
+  return initializeApp({
+    credential: cert({
+      projectId,
+      clientEmail,
+      privateKey,
+    }),
+  });
 }
 
-export const adminMessaging = admin.messaging();
-export default admin;
+/**
+ * Lazy proxy for Firebase Admin Messaging.
+ * Prevents eager initialization crashes during Next.js build-time page data collection.
+ */
+export const adminMessaging: Messaging = new Proxy({} as Messaging, {
+  get(_target, prop) {
+    const messaging = getMessaging(getAdminApp());
+    const value = (messaging as any)[prop];
+    return typeof value === "function" ? value.bind(messaging) : value;
+  },
+});
 ```
 
 ---
@@ -380,17 +400,25 @@ Now that the `/api/notifications/send` route handler is created, build a test UI
 
 ### 5.1 Create `components/SendNotificationForm.tsx`
 
-Create `components/SendNotificationForm.tsx`:
+Create `components/SendNotificationForm.tsx`. It supports an optional `defaultTargetEmail` prop so it can automatically prefill the logged-in user's email for instant self-testing, and provides a "Use my email" quick button if modified:
 
 ```tsx
 "use client";
 
 import { useState } from "react";
 
-export function SendNotificationForm() {
-  const [targetEmail, setTargetEmail] = useState("");
+interface SendNotificationFormProps {
+  defaultTargetEmail?: string;
+}
+
+export function SendNotificationForm({
+  defaultTargetEmail = "",
+}: SendNotificationFormProps) {
+  const [targetEmail, setTargetEmail] = useState(defaultTargetEmail);
   const [title, setTitle] = useState("Hello from Next.js! 🚀");
-  const [body, setBody] = useState("This is a targeted push notification sent by email.");
+  const [body, setBody] = useState(
+    "This is a targeted push notification sent by email."
+  );
   const [actionUrl, setActionUrl] = useState("/");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{
@@ -435,10 +463,23 @@ export function SendNotificationForm() {
   };
 
   return (
-    <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900 max-w-md w-full my-4">
-      <h2 className="text-lg font-semibold mb-3">Send Push Notification</h2>
+    <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900 max-w-md w-full">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-lg font-semibold">Send Push Notification</h2>
+        {defaultTargetEmail && targetEmail !== defaultTargetEmail && (
+          <button
+            type="button"
+            onClick={() => setTargetEmail(defaultTargetEmail)}
+            className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+          >
+            Use my email
+          </button>
+        )}
+      </div>
+
       <p className="text-xs text-zinc-500 mb-4">
-        Dispatch a push notification to all active devices registered under a specific user email.
+        Dispatch a push notification to all active devices registered under a
+        specific user email.
       </p>
 
       <form onSubmit={handleSend} className="space-y-3">
@@ -507,9 +548,9 @@ export function SendNotificationForm() {
         <div className="mt-4 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 rounded text-xs text-emerald-800 dark:text-emerald-200">
           <p className="font-semibold">✓ Notification dispatched!</p>
           <p>Delivered to {result.deliveredToDevices} device(s).</p>
-          {result.failedDevices! > 0 && (
-            <p className="text-amber-600 dark:text-amber-400">
-              Failed for {result.failedDevices} stale device(s) (cleaned from DB).
+          {result.failedDevices !== undefined && result.failedDevices > 0 && (
+            <p className="text-amber-600 dark:text-amber-400 mt-1">
+              Cleaned up {result.failedDevices} expired/invalid device token(s).
             </p>
           )}
         </div>
@@ -528,39 +569,71 @@ export function SendNotificationForm() {
 
 ---
 
-### 5.2 Mount the Form in `components/PushManagerWrapper.tsx`
+### 5.2 Hook up `SendNotificationForm` into `PushManager.tsx`
 
-Render `<SendNotificationForm />` alongside `<PushManager />` so authenticated users can test dispatching:
+Hook up `SendNotificationForm` inside `components/PushManager.tsx` directly beneath the push notification permission and token card:
 
 ```tsx
-// components/PushManagerWrapper.tsx
-import { auth } from "@/auth";
-import { PushManager } from "./PushManager";
+// components/PushManager.tsx
 import { SendNotificationForm } from "./SendNotificationForm";
-import Link from "next/link";
 
-const PushManagerWrapper = async () => {
-  const session = await auth();
+export function PushManager({ email }: { email: string }) {
+  // ... existing token, permission, and listener logic ...
 
-  return session ? (
-    <div className="flex flex-col gap-6 w-full max-w-md">
-      <PushManager email={session.user?.email as string} />
-      <SendNotificationForm />
-    </div>
-  ) : (
-    <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900 max-w-md">
-      <h1 className="text-lg font-semibold mb-2">Please login first</h1>
-      <Link
-        href="/login"
-        className="inline-block px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
-      >
-        Login
-      </Link>
+  return (
+    <div className="w-full max-w-md my-4 space-y-6">
+      {/* 1. Push Permission & Token Card */}
+      <div className="p-4 border rounded-lg bg-zinc-50 dark:bg-zinc-900">
+        <h2 className="text-lg font-semibold mb-2">Push Notifications</h2>
+        <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-4">
+          Status: <span className="font-medium">{permission}</span>
+        </p>
+
+        {permission !== "granted" ? (
+          <button
+            onClick={handleSubscribe}
+            className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
+          >
+            Enable Notifications
+          </button>
+        ) : (
+          <div>
+            <p className="text-xs text-green-600 dark:text-green-400 font-semibold mb-2">
+              ✓ Push notifications enabled
+            </p>
+            {token && !loading && (
+              <div className="mt-2">
+                <label className="text-xs text-zinc-500 block mb-1">
+                  Your FCM Token (for testing):
+                </label>
+                <textarea
+                  readOnly
+                  value={token}
+                  rows={3}
+                  className="w-full text-xs p-2 font-mono bg-white dark:bg-black border rounded"
+                  onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Foreground In-App Notification Card */}
+        {notification && (
+          <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 rounded">
+            <p className="font-semibold text-sm">{notification.title}</p>
+            <p className="text-xs text-zinc-600 dark:text-zinc-300">
+              {notification.body}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* 2. Sender Form automatically wired to current user's email */}
+      <SendNotificationForm defaultTargetEmail={email} />
     </div>
   );
-};
-
-export default PushManagerWrapper;
+}
 ```
 
 ---
@@ -573,7 +646,7 @@ Follow these steps to verify both foreground and background push notification be
 1. Open your browser to `http://localhost:3000` and log in with User A (`user1@example.com`).
 2. Click **"Enable Notifications"** and approve the browser prompt.
 3. Check the console and the database: the FCM device token is registered for `user1@example.com`.
-4. In the **Send Push Notification** form, enter `user1@example.com` as the recipient.
+4. In the **Send Push Notification** form, verify `user1@example.com` is prefilled.
 5. Click **"Send Notification"**:
    - **Foreground test (tab is open & focused)**: Firebase client SDK receives `onMessage` &rarr; `<PushManager />` displays the blue notification banner on the screen.
    - **Background test (minimize or switch to another tab)**: Send the notification or wait for one while the tab is blurred/minimized &rarr; the Service Worker (`firebase-messaging-sw.js`) intercepts the push and Windows/macOS shows an OS desktop notification. Clicking it focuses your tab and navigates to `actionUrl`.
@@ -591,6 +664,26 @@ Follow these steps to verify both foreground and background push notification be
 
 ## Important Production Notes & Pitfalls
 
+> [!CAUTION]
+> **Next.js Build-Time Failure: `firebase-admin` Initialization in Route Handlers**:
+> If you import `firebase-admin` using `import admin from "firebase-admin"` or evaluate `getMessaging()` eagerly at the module's top level, running `npm run build` will crash during page data collection:
+> ```text
+> ❌ Firebase Admin initialization error: TypeError: Cannot read properties of undefined (reading 'initializeApp')
+> Error: Failed to collect configuration for /api/notifications/send
+>   [cause]: Error: The default Firebase app does not exist. Make sure you call initializeApp() before using any of the Firebase services.
+> ```
+> **Why this occurs**:
+> 1. **No Default ESM Export**: In modern `firebase-admin` (v12+ / v14) bundled via Webpack, `firebase-admin` does not have a default export with `initializeApp`. `admin` evaluates to `undefined`.
+> 2. **Worker Page Data Collection**: During `next build`, Next.js spins up parallel worker threads (`Collecting page data using 11 workers`) and statically imports all API routes to extract metadata. Eager top-level `getMessaging()` calls execute immediately during the build when the app is uninitialized, crashing worker threads.
+> 
+> **How to resolve**:
+> 1. Always import from official modular subpaths:
+>    ```typescript
+>    import { initializeApp, getApps, getApp, cert, App } from "firebase-admin/app";
+>    import { getMessaging, Messaging } from "firebase-admin/messaging";
+>    ```
+> 2. Wrap `adminMessaging` in a **lazy Proxy** in `lib/firebase-admin.ts`. This ensures `getAdminApp()` and `getMessaging()` only execute when an actual HTTP request calls a messaging method at runtime, keeping build worker static analysis completely safe.
+
 > [!WARNING]
 > **Check Imports in `app/api/notifications/send/route.ts`**:
 > Ensure that both `inArray` from `"drizzle-orm"` and `notifications` from `@/lib/schema` are properly imported:
@@ -598,7 +691,7 @@ Follow these steps to verify both foreground and background push notification be
 > import { eq, inArray } from "drizzle-orm";
 > import { deviceTokens, users, notifications } from "@/lib/schema";
 > ```
-> Omitting these will throw a runtime `ReferenceError` when stale tokens are cleaned up or when notifications are inserted into the inbox.
+> Omitting these will throw a runtime `ReferenceError` when stale tokens are cleaned up or when notifications are inserted into the inbox table.
 
 > [!NOTE]
 > **Automatic Token Pruning**:
@@ -607,3 +700,49 @@ Follow these steps to verify both foreground and background push notification be
 > [!TIP]
 > **Shared Computers & Multi-User Token Reassignment**:
 > Because `deviceTokens.token` is marked `.unique()`, if Bob logs into the same physical browser profile where Alice previously logged in, the `onConflictDoUpdate` clause in Step 2 updates `userId = bob.id`. Alice will no longer receive Bob's notifications on that device.
+
+---
+
+## Notification Payload Architecture: Foreground vs. Background
+
+Understanding why and how push messages behave differently between open tabs and background states is critical for web push:
+
+| Application State | Who Catches the Event? | How It Is Displayed | Handling Mechanism |
+| :--- | :--- | :--- | :--- |
+| **Foreground** (Tab is active and focused) | Browser Firebase SDK (`onMessage`) | In-app UI banner or custom toast | React state in `PushManager.tsx` updates `setNotification({ title, body })`. The operating system does NOT pop up a tray banner by default. |
+| **Background** (Tab minimized, blurred, or closed) | Service Worker (`public/firebase-messaging-sw.js`) | Native OS desktop / mobile notification | Browser wakes `sw.js` via the `push` event and calls `self.registration.showNotification(title, options)`. |
+| **Notification Clicked** | Service Worker (`public/firebase-messaging-sw.js`) | Brings tab to focus and navigates to `actionUrl` | `notificationclick` listener iterates open client windows; if a matching window exists it focuses it; otherwise it calls `clients.openWindow(actionUrl)`. |
+
+### Dual Payload Design
+In `app/api/notifications/send/route.ts`, notifications are dispatched with both `notification` and `data` blocks:
+```typescript
+await adminMessaging.sendEachForMulticast({
+  tokens: tokens,
+  notification: {
+    title: title,
+    body: messageBody,
+  },
+  data: {
+    actionUrl: actionUrl,
+    sentAt: new Date().toISOString(),
+  },
+});
+```
+* The `notification` block (`title`, `body`) is natively recognized by Apple APNs, Android FCM, and browser push services.
+* The `data` block is used to deliver custom routing metadata (`actionUrl`, `sentAt`) that `notificationclick` uses to direct the user when they click the notification.
+
+---
+
+## Platform-Specific Requirements Checklist
+
+### Apple iOS (Safari 16.4+)
+* **Standalone PWA Required**: Web Push **does not work in normal Safari tabs**. The user must open Share &rarr; **"Add to Home Screen"**, then launch the installed app.
+* **Explicit User Gesture**: `Notification.requestPermission()` must be invoked from a direct user action (button click event), never on initial page load.
+* **HTTPS**: Strict public HTTPS is mandatory (no self-signed certificates or plain HTTP).
+
+### Android (Chrome / Chromium)
+* **Android 13+ (API 33) Runtime Permission**: The browser automatically requests the system `POST_NOTIFICATIONS` runtime permission when `Notification.requestPermission()` is resolved.
+* **Heads-Up Notifications**: Ensure notification priority is high so notifications pop over active apps.
+
+### Windows & macOS Desktop
+* **System Focus Assist / Do Not Disturb**: If desktop banners do not appear while the browser is in the background, check that Windows "Focus Assist" / "Do Not Disturb" is turned off, and verify that notifications are enabled for Google Chrome / Microsoft Edge in **Windows Settings &rarr; System &rarr; Notifications**.
