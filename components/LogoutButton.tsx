@@ -21,7 +21,7 @@ export function LogoutButton() {
         const currentToken = await registration.pushManager
           .getSubscription()
           .then((sub) => (sub ? sub.endpoint : null));
-
+        console.log("Current token when logging out", currentToken);
         // Or pass the known token stored in state/storage
         if (currentToken) {
           await fetch("/api/notifications/unregister-token", {
@@ -38,7 +38,7 @@ export function LogoutButton() {
       console.error("Error cleaning up push token on logout:", err);
     } finally {
       // 2. Clear NextAuth session and redirect
-      await signOut({ callbackUrl: "/login" });
+      // await signOut({ callbackUrl: "/login" });
       setLoading(false);
     }
   };
