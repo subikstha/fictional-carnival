@@ -16,6 +16,11 @@ export async function POST(request: Request) {
     }
 
     await db.delete(deviceTokens).where(eq(deviceTokens.token, token));
+
+    return NextResponse.json({
+      success: true,
+      message: "Token unregistered successfully",
+    });
   } catch (error: any) {
     console.error("Error deleting token");
     return NextResponse.json(

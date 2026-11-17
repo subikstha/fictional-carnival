@@ -42,7 +42,7 @@ export function LogoutButton() {
       console.error("Error cleaning up push token on logout:", err);
     } finally {
       // 2. Clear NextAuth session and redirect
-      // await signOut({ callbackUrl: "/login" });
+      await signOut({ callbackUrl: "/login" });
       setLoading(false);
     }
   };
