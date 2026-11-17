@@ -746,3 +746,133 @@ await adminMessaging.sendEachForMulticast({
 
 ### Windows & macOS Desktop
 * **System Focus Assist / Do Not Disturb**: If desktop banners do not appear while the browser is in the background, check that Windows "Focus Assist" / "Do Not Disturb" is turned off, and verify that notifications are enabled for Google Chrome / Microsoft Edge in **Windows Settings &rarr; System &rarr; Notifications**.
+
+---
+
+## User Logout & Token Lifecycle Management
+
+### Does a User Still Receive Notifications After Logging Out?
+
+**Yes.** With standard session-based auth (like NextAuth / Auth.js), logging out clears authentication cookies, but **does not stop Web Push notifications by default**.
+
+#### Why Push Notifications Persist After Logout:
+1. **Push Subscriptions Live at the OS & Browser Level**:
+   * The Service Worker (`/sw.js` and `/firebase-messaging-sw.js`) and the browser push subscription operate independently of NextAuth session cookies.
+   * Even when the browser tab is closed and no user session exists, the browser background daemon remains registered with Firebase Cloud Messaging (FCM).
+2. **The Database Record Persists**:
+   * When the user registered their device, their FCM token was stored in PostgreSQL (`deviceTokens` table) linked to their `userId`.
+   * Standard logout clears the local auth session, but leaves the `deviceTokens` record untouched in the database.
+3. **The Dispatch Handler Still Targets the Device**:
+   * When an event calls `POST /api/notifications/send` targeting `user@example.com`, the server finds the token in `deviceTokens`, sends the message to Firebase Admin, and the device displays the notification.
+
+#### Privacy & Security Risk on Shared Computers:
+If User A logs out on a shared or public computer (e.g. library, internet cafe, office workstation), private notifications for User A will continue popping up as desktop notifications on that device until:
+* User B logs in on that exact browser and enables notifications (which reassigns the token via `onConflictDoUpdate`), or
+* The user manually revokes notification permissions in the browser settings.
+
+---
+
+### How to Implement Token Unregistration on Logout
+
+To ensure notifications stop immediately when a user logs out, implement an unregistration pipeline:
+
+#### 1. Create the Unregister Route Handler (`app/api/notifications/unregister-token/route.ts`)
+
+Create `app/api/notifications/unregister-token/route.ts` to purge the device token from the database:
+
+```typescript
+// app/api/notifications/unregister-token/route.ts
+import { NextResponse } from "next/server";
+import { eq } from "drizzle-orm";
+import { db } from "@/lib/connection";
+import { deviceTokens } from "@/lib/schema";
+
+export async function POST(request: Request) {
+  try {
+    const { token } = await request.json();
+
+    if (!token) {
+      return NextResponse.json(
+        { error: "Device token is required." },
+        { status: 400 }
+      );
+    }
+
+    await db.delete(deviceTokens).where(eq(deviceTokens.token, token));
+
+    return NextResponse.json({
+      success: true,
+      message: "Device token unregistered successfully.",
+    });
+  } catch (error: any) {
+    console.error("Error unregistering token:", error);
+    return NextResponse.json(
+      { error: error.message || "Failed to unregister token" },
+      { status: 500 }
+    );
+  }
+}
+```
+
+#### 2. Update the Client Logout Flow (`components/LogoutButton.tsx`)
+
+In your logout handler, perform two cleanup tasks before clearing the NextAuth session:
+1. Delete the token from your database (`/api/notifications/unregister-token`).
+2. Revoke the token from Google's FCM servers using `deleteToken(messaging)`:
+
+```tsx
+// components/LogoutButton.tsx
+"use client";
+
+import { useState } from "react";
+import { signOut } from "next-auth/react";
+import { deleteToken } from "firebase/messaging";
+import { getClientMessaging } from "@/lib/firebase";
+
+export function LogoutButton() {
+  const [loading, setLoading] = useState(false);
+
+  const handleLogout = async () => {
+    setLoading(true);
+    try {
+      // 1. Invalidate with Firebase and retrieve the token to unregister
+      const messaging = await getClientMessaging();
+      if (messaging) {
+        // Attempt to unregister from our database before revoking from Google
+        const registration = await navigator.serviceWorker.ready;
+        const currentToken = await registration.pushManager
+          .getSubscription()
+          .then((sub) => sub ? sub.endpoint : null);
+
+        // Or pass the known token stored in state/storage
+        if (currentToken) {
+          await fetch("/api/notifications/unregister-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token: currentToken }),
+          });
+        }
+
+        // Revoke the token on Google FCM servers
+        await deleteToken(messaging);
+      }
+    } catch (err) {
+      console.error("Error cleaning up push token on logout:", err);
+    } finally {
+      // 2. Clear NextAuth session and redirect
+      await signOut({ callbackUrl: "/login" });
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleLogout}
+      disabled={loading}
+      className="px-3 py-1.5 rounded-md border border-zinc-300 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-sm font-medium transition-colors disabled:opacity-50 cursor-pointer"
+    >
+      {loading ? "Logging out..." : "Log out"}
+    </button>
+  );
+}
+```
