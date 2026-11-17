@@ -2,6 +2,9 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { deleteToken } from "firebase/messaging";
+import { getClientMessaging } from "@/lib/firebase";
+import { signOut } from "next-auth/react";
 
 export function LogoutButton() {
   const [loading, setLoading] = useState(false);
@@ -10,12 +13,32 @@ export function LogoutButton() {
   const handleLogout = async () => {
     setLoading(true);
     try {
-      await fetch("/api/auth/logout", { method: "POST" });
-      router.refresh();
-      router.push("/login");
+      // 1. Invalidate with Firebase and retrieve the token to unregister
+      const messaging = await getClientMessaging();
+      if (messaging) {
+        // Attempt to unregister from our database before revoking from Google
+        const registration = await navigator.serviceWorker.ready;
+        const currentToken = await registration.pushManager
+          .getSubscription()
+          .then((sub) => (sub ? sub.endpoint : null));
+
+        // Or pass the known token stored in state/storage
+        if (currentToken) {
+          await fetch("/api/notifications/unregister-token", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token: currentToken }),
+          });
+        }
+
+        // Revoke the token on Google FCM servers
+        await deleteToken(messaging);
+      }
     } catch (err) {
-      console.error("Logout failed:", err);
+      console.error("Error cleaning up push token on logout:", err);
     } finally {
+      // 2. Clear NextAuth session and redirect
+      await signOut({ callbackUrl: "/login" });
       setLoading(false);
     }
   };
