@@ -7,7 +7,7 @@ const PushManagerWrapper = async () => {
   console.log("Session in wrapper", session);
   return session ? (
     <>
-      <PushManager />
+      <PushManager email={session.user?.email as string} />
     </>
   ) : (
     <>

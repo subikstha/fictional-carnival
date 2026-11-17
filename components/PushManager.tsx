@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { getToken, onMessage } from "firebase/messaging";
 import { getClientMessaging } from "@/lib/firebase";
 
-export function PushManager() {
+export function PushManager({ email }: { email: string }) {
   const [token, setToken] = useState<string | null>(null);
   const [notification, setNotification] = useState<{
     title?: string;
@@ -31,6 +31,15 @@ export function PushManager() {
       if (currentToken) {
         console.log("FCM token got from retrive Token", currentToken);
         setToken(currentToken);
+        // Call the backend api to save the token
+        await fetch("/api/notifications/register-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email,
+            token: currentToken,
+          }),
+        });
       }
     } catch (error) {
       console.error("Error retrieving token", error);
@@ -89,6 +98,16 @@ export function PushManager() {
       if (currentToken) {
         console.log("FCM token", currentToken);
         setToken(currentToken);
+
+        // Call the backend api to save the token
+        await fetch("/api/notifications/register-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email,
+            token: currentToken,
+          }),
+        });
       }
     } catch (error) {
       console.error("Error retrieving token:", error);

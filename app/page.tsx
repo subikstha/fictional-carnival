@@ -1,4 +1,4 @@
-import { PushManager } from "@/components/PushManager";
+import { Suspense } from "react";
 import PushManagerWrapper from "@/components/PushManagerWrapper";
 import Image from "next/image";
 
@@ -65,7 +65,12 @@ export default function Home() {
             Documentation
           </a>
         </div> */}
-        <PushManagerWrapper />
+        <Suspense
+          fallback={<p className="text-sm">Checking Authentication...</p>}
+        >
+          <PushManagerWrapper />
+        </Suspense>
+
         {/* <PushManager /> */}
       </main>
     </div>

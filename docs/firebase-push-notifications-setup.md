@@ -6,9 +6,10 @@ This guide details how to integrate Firebase Cloud Messaging (FCM) push notifica
 
 ## Architecture Overview
 
-Instead of running two independent service workers (`sw.js` and `firebase-messaging-sw.js`), this setup uses `next-pwa`'s `importScripts` configuration. 
+Instead of running two independent service workers (`sw.js` and `firebase-messaging-sw.js`), this setup uses `next-pwa`'s `importScripts` configuration.
 
 When you build the application, `next-pwa` injects:
+
 1. Firebase App Compat CDN (`firebase-app-compat.js`)
 2. Firebase Messaging Compat CDN (`firebase-messaging-compat.js`)
 3. Your custom worker logic (`/firebase-messaging-sw.js`)
@@ -20,17 +21,18 @@ directly into the primary service worker (`/sw.js`). A single service worker han
 ## Why We Need Separate `firebase.ts` and `firebase-messaging-sw.js`
 
 A common question when configuring web push in Next.js is why Firebase must be initialized in two different files:
+
 - `lib/firebase.ts` (Client Application)
 - `public/firebase-messaging-sw.js` (Service Worker)
 
 They exist because they execute in **two completely distinct JavaScript runtimes with divided responsibilities**:
 
-| Dimension | `lib/firebase.ts` (Client App) | `public/firebase-messaging-sw.js` (Service Worker) |
-| :--- | :--- | :--- |
-| **Runtime Environment** | Main browser window thread (React / DOM context). | Background worker thread (`ServiceWorkerGlobalScope`). |
-| **Lifecycle** | Runs only while the user is actively visiting a tab. Dies when all tabs close. | Runs in the background independently; can wake up even when the browser tab is closed. |
-| **Available APIs** | Has access to `window`, `document`, React state, user clicks, and browser storage. | **No `window` or DOM access**. Has access to Service Worker APIs (`self.registration`, `clients`). |
-| **Module Format** | Modern ES Modules (`import { initializeApp } from "firebase/app"`). | Classic script loaded via `importScripts(...)` and Firebase compat CDN. |
+| Dimension                 | `lib/firebase.ts` (Client App)                                                                                                                                                                                                                 | `public/firebase-messaging-sw.js` (Service Worker)                                                                                                                                                                               |
+| :------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Runtime Environment**   | Main browser window thread (React / DOM context).                                                                                                                                                                                              | Background worker thread (`ServiceWorkerGlobalScope`).                                                                                                                                                                           |
+| **Lifecycle**             | Runs only while the user is actively visiting a tab. Dies when all tabs close.                                                                                                                                                                 | Runs in the background independently; can wake up even when the browser tab is closed.                                                                                                                                           |
+| **Available APIs**        | Has access to `window`, `document`, React state, user clicks, and browser storage.                                                                                                                                                             | **No `window` or DOM access**. Has access to Service Worker APIs (`self.registration`, `clients`).                                                                                                                               |
+| **Module Format**         | Modern ES Modules (`import { initializeApp } from "firebase/app"`).                                                                                                                                                                            | Classic script loaded via `importScripts(...)` and Firebase compat CDN.                                                                                                                                                          |
 | **Core Responsibilities** | 1. Prompts the user for notification permissions (`Notification.requestPermission()`).<br>2. Requests the FCM device token via `getToken()`.<br>3. Listens to notifications while the tab is **active and in the foreground** (`onMessage()`). | 1. Listens for background `push` events from Google servers.<br>2. Displays OS notifications via `self.registration.showNotification()`.<br>3. Handles notification clicks (`notificationclick`) to focus or reopen app windows. |
 
 > **Key Takeaway**: React code in `lib/firebase.ts` cannot receive push notifications when the website is closed or minimized. Conversely, the background worker in `firebase-messaging-sw.js` cannot interact with React or prompt the user for notification permissions. Both are required to cover the full push notification lifecycle.
@@ -40,19 +42,23 @@ They exist because they execute in **two completely distinct JavaScript runtimes
 ## Step 1: Firebase Console & VAPID Key Setup
 
 ### 1. Grab `firebaseConfig`
+
 1. Open the [Firebase Console](https://console.firebase.google.com/) and select your project.
 2. Click the **Gear icon ⚙️** (Project Settings) &rarr; **General** tab.
 3. Scroll down to **Your apps**, find your Web App (or click **Add app** &rarr; **Web `</>`**), and copy the `firebaseConfig` keys.
 
 ### 2. Generate the VAPID Key (Web Push Certificate)
+
 1. In **Project Settings**, go to the **Cloud Messaging** tab.
 2. Scroll down to **Web configuration** &rarr; **Web Push certificates**.
 3. Click the **Generate key pair** button (if not already generated).
 4. Copy the long public key string under the **Key pair** column.
 
 ### VAPID Key Requirements & Common Pitfall
+
 > [!WARNING]
 > **Do not confuse the VAPID key with the Google Analytics `measurementId`!**
+>
 > - **Google Analytics Measurement ID**: Starts with `G-` (e.g., `G-W5HXFWJV8R`). This is **NOT** a VAPID key.
 > - **Real VAPID Key**: An elliptic curve P-256 public key encoded in URL-safe base64. It is typically ~87–88 characters long and often begins with `B` (e.g., `BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvSo4_W82Ux8...`).
 >
@@ -140,7 +146,9 @@ self.addEventListener("push", (event) => {
     self.registration
       .showNotification(title, options)
       .then(() => console.log("✅ [SW] Notification shown successfully"))
-      .catch((err) => console.error("❌ [SW] Notification display error:", err))
+      .catch((err) =>
+        console.error("❌ [SW] Notification display error:", err),
+      ),
   );
 });
 
@@ -167,7 +175,7 @@ self.addEventListener("notificationclick", (event) => {
         // If app is closed, open a new window
         const targetUrl = payloadData?.url || "/";
         return self.clients.openWindow(targetUrl);
-      })
+      }),
   );
 });
 ```
@@ -242,7 +250,7 @@ export const getClientMessaging = async (): Promise<Messaging | null> => {
   if (typeof window === "undefined") return null;
   if (!messagingPromise) {
     messagingPromise = isSupported().then((supported) =>
-      supported ? getMessaging(app) : null
+      supported ? getMessaging(app) : null,
     );
   }
   return messagingPromise;
@@ -256,6 +264,7 @@ export { app };
 ## Step 7: Request Permission & Obtain FCM Token
 
 Create a UI component `components/PushManager.tsx` that:
+
 1. Requests notification permission (`Notification.requestPermission()`).
 2. Registers `/sw.js` and waits for it to be ready.
 3. Retrieves the device registration token via `getToken()` with `serviceWorkerRegistration`.
@@ -271,8 +280,12 @@ import { getClientMessaging } from "@/lib/firebase";
 
 export function PushManager() {
   const [token, setToken] = useState<string | null>(null);
-  const [notification, setNotification] = useState<{ title?: string; body?: string } | null>(null);
-  const [permission, setPermission] = useState<NotificationPermission>("default");
+  const [notification, setNotification] = useState<{
+    title?: string;
+    body?: string;
+  } | null>(null);
+  const [permission, setPermission] =
+    useState<NotificationPermission>("default");
 
   useEffect(() => {
     if ("Notification" in window) {
@@ -345,7 +358,9 @@ export function PushManager() {
           </p>
           {token && (
             <div className="mt-2">
-              <label className="text-xs text-zinc-500 block mb-1">Your FCM Token (for testing):</label>
+              <label className="text-xs text-zinc-500 block mb-1">
+                Your FCM Token (for testing):
+              </label>
               <textarea
                 readOnly
                 value={token}
@@ -361,7 +376,9 @@ export function PushManager() {
       {notification && (
         <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 rounded">
           <p className="font-semibold text-sm">{notification.title}</p>
-          <p className="text-xs text-zinc-600 dark:text-zinc-300">{notification.body}</p>
+          <p className="text-xs text-zinc-600 dark:text-zinc-300">
+            {notification.body}
+          </p>
         </div>
       )}
     </div>
@@ -376,6 +393,7 @@ Mount `<PushManager />` inside `app/page.tsx` or your desired page.
 ## Step 8: Build and Run
 
 ### 1. Build using Webpack
+
 Ensure `package.json` uses `"build": "next build --webpack"`:
 
 ```bash
@@ -383,6 +401,7 @@ npm run build
 ```
 
 Verify that [public/sw.js](file:///F:/projects/playground/web-push/public/sw.js) contains:
+
 ```javascript
 importScripts(
   "https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js",
@@ -393,6 +412,7 @@ importScripts(
 ```
 
 ### 2. Start the Production Server
+
 ```bash
 npm run start -- -p 8009
 ```
@@ -402,11 +422,13 @@ npm run start -- -p 8009
 ## Step 9: How to Send & Test Notifications
 
 ### 1. Obtain the FCM Device Token
+
 1. Open `http://localhost:8009` in your browser.
 2. Click **Enable Notifications** and approve the browser prompt.
 3. The long **FCM Device Token** will appear in the textarea. Click to copy it.
 
 ### 2. Send a Test Push from Firebase Console
+
 1. Open the [Firebase Console](https://console.firebase.google.com/) for your project.
 2. In the left navigation menu, expand **Engage** &rarr; select **Messaging** (or **Campaigns**).
 3. Click **New campaign** &rarr; select **Firebase Notification messages**.
@@ -420,12 +442,14 @@ npm run start -- -p 8009
 ### 3. Verify Both Push Scenarios
 
 #### Scenario A: Background Push (Native OS Toast)
+
 1. **Minimize your browser window** or switch to another tab (such as the Firebase Console tab).
 2. Click **Test** in Firebase Console.
 3. Within 1–3 seconds, your operating system will display an OS-level notification toast in the corner of your screen.
 4. Click the notification toast &rarr; the browser will automatically focus or reopen your Next.js application tab.
 
 #### Scenario B: Foreground Notification (In-App)
+
 1. Keep the `http://localhost:8009` tab **active, visible, and in focus**.
 2. Click **Test** in Firebase Console.
 3. Because the tab is currently focused, the service worker hands the message to `onMessage()` inside `components/PushManager.tsx`, and the notification banner will render directly inside your webpage.
@@ -434,9 +458,9 @@ npm run start -- -p 8009
 
 ## Troubleshooting Checklist
 
-| Issue | Cause | Fix |
-| :--- | :--- | :--- |
-| `Failed to execute 'subscribe' on 'PushManager': The provided applicationServerKey is not valid` | Using the Google Analytics `measurementId` (`G-...`) instead of a VAPID key | Generate a real VAPID key in **Project Settings > Cloud Messaging > Web Push certificates** (~87 chars) and update `NEXT_PUBLIC_FIREBASE_VAPID_KEY`. |
-| No notification toast in background | OS Focus Assist / Do Not Disturb is enabled, or notificationclick is nested inside push | Check Windows/Mac Notification & Focus Assist settings; ensure `notificationclick` is at the top level of `public/firebase-messaging-sw.js`. |
-| Service worker not generating in `/public` | Built using Turbopack instead of Webpack | Ensure `package.json` build script is `"build": "next build --webpack"`. |
-| Firebase attempts to register a second service worker | `getToken()` called without `serviceWorkerRegistration` | Pass `{ serviceWorkerRegistration: registration }` inside `getToken()`. |
+| Issue                                                                                            | Cause                                                                                   | Fix                                                                                                                                                  |
+| :----------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Failed to execute 'subscribe' on 'PushManager': The provided applicationServerKey is not valid` | Using the Google Analytics `measurementId` (`G-...`) instead of a VAPID key             | Generate a real VAPID key in **Project Settings > Cloud Messaging > Web Push certificates** (~87 chars) and update `NEXT_PUBLIC_FIREBASE_VAPID_KEY`. |
+| No notification toast in background                                                              | OS Focus Assist / Do Not Disturb is enabled, or notificationclick is nested inside push | Check Windows/Mac Notification & Focus Assist settings; ensure `notificationclick` is at the top level of `public/firebase-messaging-sw.js`.         |
+| Service worker not generating in `/public`                                                       | Built using Turbopack instead of Webpack                                                | Ensure `package.json` build script is `"build": "next build --webpack"`.                                                                             |
+| Firebase attempts to register a second service worker                                            | `getToken()` called without `serviceWorkerRegistration`                                 | Pass `{ serviceWorkerRegistration: registration }` inside `getToken()`.                                                                              |
