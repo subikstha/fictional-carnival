@@ -36,14 +36,6 @@ export default function NotificationsClient() {
         <li key={n.id} className="p-4 border rounded-lg">
           <h2 className="font-semibold text-lg">{n.title}</h2>
           <p className="text-gray-600">{n.body}</p>
-          {n.actionUrl && (
-            <a
-              href={n.actionUrl}
-              className="text-blue-500 hover:underline text-sm mt-2 inline-block"
-            >
-              View &rarr;
-            </a>
-          )}
         </li>
       ))}
     </ul>
