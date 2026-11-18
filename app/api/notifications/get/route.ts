@@ -2,9 +2,10 @@ import { auth } from "@/auth";
 import { db } from "@/lib/connection";
 import { notifications } from "@/lib/schema";
 import { eq, desc } from "drizzle-orm";
-import { NextResponse } from "next/server";
+import { NextResponse, connection } from "next/server";
 
 export async function GET() {
+  await connection();
   try {
     const session = await auth();
 

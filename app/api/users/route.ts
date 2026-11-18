@@ -2,9 +2,10 @@ import { auth } from "@/auth";
 import { db } from "@/lib/connection";
 import { users, deviceTokens } from "@/lib/schema";
 import { count, eq } from "drizzle-orm";
-import { NextResponse } from "next/server";
+import { NextResponse, connection } from "next/server";
 
 export async function GET() {
+  await connection();
   try {
     const session = await auth();
     if (!session?.user) {

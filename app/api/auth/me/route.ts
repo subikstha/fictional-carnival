@@ -1,7 +1,8 @@
-import { NextResponse } from "next/server";
+import { NextResponse, connection } from "next/server";
 import { auth } from "@/auth";
 
 export async function GET() {
+  await connection();
   const session = await auth();
 
   if (!session?.user) {
