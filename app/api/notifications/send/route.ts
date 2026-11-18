@@ -7,7 +7,12 @@ import { NextResponse } from "next/server";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { targetEmail, title, body: messageBody, actionUrl = "/" } = body;
+    const {
+      targetEmail,
+      title,
+      body: messageBody,
+      actionUrl = "/user/notifications",
+    } = body;
 
     // 1. Validate the inputs
     if (!targetEmail || !title || !messageBody) {
