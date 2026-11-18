@@ -276,3 +276,127 @@ npm run start -- -p 8009
 1. Open `http://localhost:8009`.
 2. Open DevTools (`F12`) &rarr; **Application** tab &rarr; **Service Workers**.
 3. You will see `/sw.js` registered and active with status: **Activated and is running**.
+
+---
+
+## 8. Production Auto-Update & Service Worker Lifecycle Management
+
+When you deploy a new version to production (e.g. pushing to `main`):
+1. Next.js generates new JS/CSS chunk hashes and a newly hashed `/sw.js`.
+2. Browsers check `/sw.js` for byte changes.
+3. Without an update manager, the new service worker sits in the `waiting` state until all user tabs are closed.
+
+### Implementation: Event-Driven Update Manager (`app/sw-register.tsx`)
+
+In `app/sw-register.tsx`, register the worker and actively listen for updates on focus, visibility change, and intervals, showing an update prompt:
+
+```tsx
+// app/sw-register.tsx
+"use client";
+
+import { useEffect, useState, useRef } from "react";
+
+export function ServiceWorkerRegister() {
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const registrationRef = useRef<ServiceWorkerRegistration | null>(null);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator) || process.env.NODE_ENV !== "production") {
+      return;
+    }
+
+    let refreshing = false;
+
+    // 1. Detect when a new service worker takes control
+    const handleControllerChange = () => {
+      if (refreshing) return;
+      refreshing = true;
+      setUpdateAvailable(true);
+    };
+
+    navigator.serviceWorker.addEventListener("controllerchange", handleControllerChange);
+
+    // 2. Register Service Worker
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then((registration) => {
+        registrationRef.current = registration;
+
+        if (registration.waiting) {
+          setUpdateAvailable(true);
+        }
+
+        // 3. Listen for new worker installation
+        registration.addEventListener("updatefound", () => {
+          const newWorker = registration.installing;
+          if (!newWorker) return;
+
+          newWorker.addEventListener("statechange", () => {
+            if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+              setUpdateAvailable(true);
+            }
+          });
+        });
+      })
+      .catch((error) => console.error("Service worker registration failed:", error));
+
+    // 4. Actively check for updates whenever the user returns to the tab
+    const checkForUpdates = () => {
+      if (registrationRef.current) {
+        registrationRef.current
+          .update()
+          .then((reg) => {
+            if (reg.waiting) setUpdateAvailable(true);
+          })
+          .catch((err) => console.log("[PWA] Update check error:", err));
+      }
+    };
+
+    window.addEventListener("focus", checkForUpdates);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") checkForUpdates();
+    });
+
+    const interval = setInterval(checkForUpdates, 30 * 60 * 1000);
+
+    return () => {
+      navigator.serviceWorker.removeEventListener("controllerchange", handleControllerChange);
+      window.removeEventListener("focus", checkForUpdates);
+      clearInterval(interval);
+    };
+  }, []);
+
+  const handleUpdate = () => {
+    const reg = registrationRef.current;
+    if (reg?.waiting) {
+      reg.waiting.postMessage({ type: "SKIP_WAITING" });
+    }
+    window.location.reload();
+  };
+
+  if (!updateAvailable) return null;
+
+  return (
+    <div className="fixed bottom-5 right-5 z-50 flex items-center gap-3 p-3.5 bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 rounded-xl shadow-2xl border border-zinc-700 dark:border-zinc-300 text-xs animate-in slide-in-from-bottom duration-300">
+      <span className="relative flex h-2.5 w-2.5">
+        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+      </span>
+      <span className="font-medium">New version available!</span>
+      <button
+        onClick={handleUpdate}
+        className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-md font-semibold transition-colors cursor-pointer"
+      >
+        Update Now
+      </button>
+      <button
+        onClick={() => setUpdateAvailable(false)}
+        className="text-zinc-400 hover:text-zinc-200 dark:hover:text-zinc-700 text-sm ml-1 cursor-pointer"
+        aria-label="Dismiss"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+```
