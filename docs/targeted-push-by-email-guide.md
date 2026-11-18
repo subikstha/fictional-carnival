@@ -733,7 +733,8 @@ Understanding why and how push messages behave differently between open tabs and
 | **Background** (Tab minimized, blurred, or closed) | Service Worker (`public/firebase-messaging-sw.js`) | Native OS desktop / mobile notification | Browser wakes `sw.js` via the `push` event and calls `self.registration.showNotification(title, options)`. |
 | **Notification Clicked** | Service Worker (`public/firebase-messaging-sw.js`) | Brings tab to focus and navigates to `actionUrl` | `notificationclick` listener iterates open client windows; if a matching window exists it focuses it; otherwise it calls `clients.openWindow(actionUrl)`. |
 
-### Dual Payload Design
+### Dual Payload Design & Service Worker Extraction Pitfalls
+
 In `app/api/notifications/send/route.ts`, notifications are dispatched with both `notification` and `data` blocks:
 ```typescript
 await adminMessaging.sendEachForMulticast({
@@ -750,6 +751,61 @@ await adminMessaging.sendEachForMulticast({
 ```
 * The `notification` block (`title`, `body`) is natively recognized by Apple APNs, Android FCM, and browser push services.
 * The `data` block is used to deliver custom routing metadata (`actionUrl`, `sentAt`) that `notificationclick` uses to direct the user when they click the notification.
+
+#### ⚠️ Critical Service Worker Extraction Bug (`payload.data || payload.notification`)
+
+A very common pitfall in `firebase-messaging-sw.js` is writing:
+
+```javascript
+// ❌ BROKEN: Exclusive fallback pattern
+const data = payload.data || payload.notification || {};
+const title = data.title || "New notification";
+const body = data.body || "";
+```
+
+**Why this breaks in production**:
+In JavaScript, `A || B` evaluates `A` first. Because `payload.data` is an object containing `{ actionUrl: "...", sentAt: "..." }`, it is truthy!
+1. JavaScript chooses `payload.data` and **completely drops `payload.notification`**.
+2. Because `payload.data` does not contain `title` or `body` (they are in `payload.notification`), `data.title` evaluates to `undefined`, falling back to `"New notification"`.
+3. `data.body` evaluates to `undefined`, displaying a completely blank notification body (`""`)!
+
+#### ✅ The Robust Payload Extraction Pattern
+
+To safely extract from both blocks regardless of whether the message is a pure `notification`, pure `data`, or combined dual payload:
+
+```javascript
+// public/firebase-messaging-sw.js - Inside the 'push' event listener:
+
+// 1. Separate both blocks
+const notification = payload.notification || {};
+const data = payload.data || {};
+
+// 2. Chained fallback extraction (check notification first, then data, then default)
+const title = notification.title || data.title || "New notification";
+const body = notification.body || data.body || "";
+const icon = notification.icon || data.icon || "/favicon.ico";
+
+// 3. Merge custom data so notificationclick receives all routing metadata
+const clickData = {
+  ...data,
+  ...notification,
+  actionUrl: data.actionUrl || data.url || notification.click_action || "/",
+};
+
+const options = {
+  body: body,
+  icon: icon,
+  badge: notification.badge || data.badge || "/favicon.ico",
+  data: clickData,
+};
+
+event.waitUntil(self.registration.showNotification(title, options));
+```
+
+#### Why This Fix Works:
+1. **Never Blank**: Whether the server dispatches `{ notification: { title, body } }`, `{ data: { title, body } }`, or both, the actual title and body are always found.
+2. **Metadata Preserved**: Custom properties in `data` (e.g. `actionUrl`, `orderId`, `sentAt`) are merged into `event.notification.data`.
+3. **Deep-Linking Alignment**: `actionUrl` is guaranteed to be available for the `notificationclick` handler instead of defaulting back to `"/"`.
 
 ---
 
@@ -982,6 +1038,93 @@ self.addEventListener("notificationclick", (event) => {
           }
         }
         // 2. Otherwise open a new window to the target URL
+        return self.clients.openWindow(targetUrl);
+      })
+  );
+});
+```
+
+### 7.2 Complete Robust Service Worker (`public/firebase-messaging-sw.js`)
+
+Here is the complete, recommended Service Worker code combining proper Firebase compat initialization, dual-payload parsing, and deep-link click handling:
+
+```javascript
+// public/firebase-messaging-sw.js
+
+// 1. Firebase configuration
+const firebaseConfig = {
+  apiKey: "your-api-key",
+  authDomain: "your-app.firebaseapp.com",
+  projectId: "your-project-id",
+  storageBucket: "your-app.firebasestorage.app",
+  messagingSenderId: "your-sender-id",
+  appId: "your-app-id",
+};
+
+if (!firebase.apps.length) {
+  firebase.initializeApp(firebaseConfig);
+}
+
+const messaging = firebase.messaging();
+
+// 2. Push event listener (with dual payload extraction & fallback chaining)
+self.addEventListener("push", (event) => {
+  if (!event.data) return;
+
+  let payload;
+  try {
+    payload = event.data.json();
+  } catch (error) {
+    console.error("Failed to parse push data:", error);
+    return;
+  }
+
+  // Safe extraction from both blocks
+  const notification = payload.notification || {};
+  const data = payload.data || {};
+
+  const title = notification.title || data.title || "New notification";
+  const body = notification.body || data.body || "";
+  const icon = notification.icon || data.icon || "/favicon.ico";
+
+  const clickData = {
+    ...data,
+    ...notification,
+    actionUrl: data.actionUrl || data.url || notification.click_action || "/",
+  };
+
+  const options = {
+    body: body,
+    icon: icon,
+    badge: notification.badge || data.badge || "/favicon.ico",
+    data: clickData,
+  };
+
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+// 3. Notification click listener (with deep-link focus & navigation)
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const payloadData = event.notification.data || {};
+  const targetUrl = payloadData.actionUrl || payloadData.url || "/";
+
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((clientsArr) => {
+        // Focus existing matching window if open
+        for (const client of clientsArr) {
+          if (client.url.startsWith(self.location.origin)) {
+            client.postMessage({
+              type: "FCM_ACTION",
+              payload: payloadData,
+            });
+            client.navigate(targetUrl);
+            return client.focus();
+          }
+        }
+        // Otherwise open a new window to the target URL
         return self.clients.openWindow(targetUrl);
       })
   );
