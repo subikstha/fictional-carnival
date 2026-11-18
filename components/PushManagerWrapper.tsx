@@ -1,22 +1,18 @@
 import { auth } from "@/auth";
 import { PushManager } from "./PushManager";
-import Link from "next/link";
+import { redirect } from "next/navigation";
 
 const PushManagerWrapper = async () => {
   const session = await auth();
-  console.log("Session in wrapper", session);
-  return session ? (
-    <>
-      <PushManager
-        email={session.user?.email as string}
-        username={session?.user?.name as string}
-      />
-    </>
-  ) : (
-    <>
-      <h1>Please login first</h1>
-      <Link href="/login">Login</Link>
-    </>
+  if (!session) {
+    redirect("/login");
+  }
+
+  return (
+    <PushManager
+      email={session.user?.email as string}
+      username={session?.user?.name as string}
+    />
   );
 };
 
