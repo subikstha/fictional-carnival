@@ -80,14 +80,15 @@ export async function POST(request: Request) {
     // 5. Dispatch the push notifications to all their devices
     const response = await adminMessaging.sendEachForMulticast({
       tokens: tokens,
-      // notification: {
-      //   title: title,
-      //   body: messageBody,
-      // },
+      notification: {
+        title: title,
+        body: messageBody,
+      },
       data: {
         title: title,
         body: messageBody,
         actionUrl: actionUrl,
+
         sentAt: new Date().toISOString(),
       },
       // webpush: {
