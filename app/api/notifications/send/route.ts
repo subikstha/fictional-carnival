@@ -80,11 +80,13 @@ export async function POST(request: Request) {
     // 5. Dispatch the push notifications to all their devices
     const response = await adminMessaging.sendEachForMulticast({
       tokens: tokens,
-      notification: {
+      // notification: {
+      //   title: title,
+      //   body: messageBody,
+      // },
+      data: {
         title: title,
         body: messageBody,
-      },
-      data: {
         actionUrl: actionUrl,
         sentAt: new Date().toISOString(),
       },
@@ -99,6 +101,8 @@ export async function POST(request: Request) {
       //   },
       // },
     });
+
+    console.log("Response back from the firebase", response);
 
     // 6. Clean up stale/invalid tokens reported by Firebase
     const deadTokens: string[] = [];
