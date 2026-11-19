@@ -80,6 +80,7 @@ export async function POST(request: Request) {
     // 5. Dispatch the push notifications to all their devices
     const response = await adminMessaging.sendEachForMulticast({
       tokens: tokens,
+      // The notification block causes two notifications to arrive
       notification: {
         title: title,
         body: messageBody,

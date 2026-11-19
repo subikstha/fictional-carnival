@@ -22,6 +22,7 @@ Firebase Cloud Messaging (FCM) routes notifications using **Device Registration 
 [Backend Dispatch Event] ──> Look up tokens for "user@example.com" ──> adminMessaging.sendEachForMulticast()
 ```
 
+
 ---
 
 ## End-to-End Implementation Roadmap
@@ -62,6 +63,7 @@ In your terminal, install the package:
 ```bash
 npm install firebase-admin
 ```
+
 
 ---
 
@@ -151,6 +153,7 @@ export const adminMessaging: Messaging = new Proxy({} as Messaging, {
   },
 });
 ```
+
 
 ---
 
@@ -261,6 +264,7 @@ export async function POST(request: Request) {
 }
 ```
 
+
 ---
 
 ## Step 3: Client Token Registration (`PushManager.tsx`)
@@ -286,6 +290,7 @@ const registerTokenOnBackend = async (currentToken: string, userEmail: string) =
   }
 };
 ```
+
 
 ---
 
@@ -416,6 +421,7 @@ export async function POST(request: Request) {
 }
 ```
 
+
 ---
 
 ## Step 5: Test Sender UI Component & Verification
@@ -462,6 +468,7 @@ export async function GET() {
   }
 }
 ```
+
 
 ---
 
@@ -797,6 +804,7 @@ export function SendNotificationForm({
 }
 ```
 
+
 ---
 
 ### 5.2 Hook up `SendNotificationForm` into `PushManager.tsx`
@@ -865,6 +873,7 @@ export function PushManager({ email }: { email: string }) {
   );
 }
 ```
+
 
 ---
 
@@ -1330,6 +1339,7 @@ export function LogoutButton() {
 }
 ```
 
+
 ---
 
 ### FCM Token Expiration & Rotation Lifecycle
@@ -1543,6 +1553,80 @@ self.addEventListener("notificationclick", (event) => {
   );
 });
 ```
+
+### 7.3 Deep Dive: How `event.waitUntil` and `self.clients.matchAll` Work
+
+The `notificationclick` handler uses a pattern called **Smart Window Navigation**. Instead of opening a brand new browser tab on every single notification click (which quickly clutters the user's browser with duplicate tabs), it checks whether the app is already open, brings that tab to the front, and navigates it.
+
+Here is an architectural breakdown of every component in this pattern:
+
+#### 1. Why `event.waitUntil()` is Essential
+Service Workers do not run continuously in the background. To conserve battery and RAM, the browser spins up the worker thread only when an event occurs (`push`, `notificationclick`), and **terminates the process immediately** once synchronous code finishes (often in under 1 millisecond).
+
+Because searching open tabs and focusing/opening windows is **asynchronous** (it returns Promises), calling them without `event.waitUntil()` creates a critical race condition:
+* The synchronous code runs `event.notification.close()`.
+* The browser reaches the end of the event function, assumes work is complete, and **kills the Service Worker thread**.
+* The `.then()` callback is terminated before `client.focus()` or `clients.openWindow()` can execute. The notification closes, but **the window never opens or focuses**.
+
+Wrapping the Promise in `event.waitUntil(promise)` signals the browser:
+> *"Do not terminate this Service Worker thread yet. Keep it alive until this Promise chain completely resolves."*
+
+#### 2. `self.clients` Interface
+* `self`: The `ServiceWorkerGlobalScope`.
+* `self.clients`: A built-in browser API that provides access to all execution contexts (browser tabs, standalone PWA windows, workers, iframes) belonging to the same origin (`https://your-domain.com`).
+
+#### 3. `.matchAll({ type: "window", includeUncontrolled: true })`
+Queries the browser for all running contexts on your domain:
+* **`type: "window"`**: Filters the results to only include actual browser tabs or standalone PWA app windows. It excludes background workers and hidden iframes.
+* **`includeUncontrolled: true`** *(Critical!)*: By default, `matchAll()` only returns tabs actively controlled by this exact Service Worker version. If a user refreshed the page with `Ctrl + F5` (hard refresh), or opened the page before the Service Worker finished installing/activating, that tab is "uncontrolled". Setting `includeUncontrolled: true` ensures **any tab running on your domain is found**, even if it has not yet claimed control.
+
+#### 4. Sending In-Memory Data via `client.postMessage(...)`
+```javascript
+client.postMessage({
+  type: "FCM_ACTION",
+  payload: payloadData,
+});
+```
+Before navigating, the Service Worker sends an in-memory message to the frontend. In your React application, a listener like `navigator.serviceWorker.addEventListener("message", ...)` can immediately intercept this to update state in real-time (e.g., play an audio chime, refresh notification inbox count, or highlight an active item) before page navigation completes.
+
+#### 5. Navigating the Existing Tab (`client.navigate(targetUrl)`)
+Instructs the existing tab to change its location to `targetUrl` (e.g., `/user/notifications`). This reuses the existing DOM and session, avoiding a full cold start.
+
+#### 6. Bringing the Tab to the Foreground (`return client.focus()`)
+Brings the tab to the front of the user's screen (switches active tabs in Chrome/Edge, and un-minimizes the window on Windows/macOS/Android). 
+
+> **Important**: The `return` keyword here exits the `.then()` chain early. Because an existing tab was successfully found, focused, and navigated, execution stops and line `clients.openWindow()` is never reached.
+
+#### 7. Fallback: Opening a New Tab (`return self.clients.openWindow(targetUrl)`)
+If the `for` loop finishes without finding any open tabs on this origin (i.e. the app was completely closed), execution falls through to `clients.openWindow(targetUrl)`, which tells the browser to launch a fresh browser tab or open the standalone PWA window directly to the target URL.
+
+#### Navigation Decision Flowchart
+
+```
+User clicks notification
+         │
+         ▼
+`event.notification.close()`
+         │
+         ▼
+`self.clients.matchAll({ type: "window", includeUncontrolled: true })`
+         │
+         ├─────────────────────────────────────────┐
+         ▼                                         ▼
+[Existing tab found on origin?]         [No existing tabs found]
+         │                                         │
+         ▼                                         ▼
+1. Send `postMessage` to tab             `clients.openWindow(targetUrl)`
+2. `client.navigate(targetUrl)`                    │
+3. `return client.focus()`                         │
+         │                                         │
+         └────────────────────┬────────────────────┘
+                              ▼
+           `event.waitUntil` Promise settles
+                              ▼
+               Browser puts SW back to sleep
+```
+
 
 ---
 
@@ -2018,6 +2102,7 @@ export default function NotificationsClient() {
 }
 ```
 
+
 ---
 
 ## Step 9: User Notification Preferences & Filtering
@@ -2226,6 +2311,7 @@ const withPWA = withPWAInit({
   ],
 });
 ```
+
 
 ---
 

@@ -60,11 +60,14 @@ self.addEventListener("notificationclick", (event) => {
 
   const payloadData = event.notification.data || {};
   const targetUrl = payloadData.actionUrl || payloadData.url || "/";
-
+  // event.waitUntil guarantees that the Service Worker will stay alive until the entire .then() block finishes
+  // This prevents premature termination
   event.waitUntil(
     self.clients
       .matchAll({ type: "window", includeUncontrolled: true })
       .then((clientsArr) => {
+        console.log("This is the clientsArr", clientsArr);
+        console.log("Origin of clientsArr", self.location.origin);
         // If a window is already open on this origin, focus it and navigate
         for (const client of clientsArr) {
           if (client.url.startsWith(self.location.origin)) {
@@ -83,3 +86,15 @@ self.addEventListener("notificationclick", (event) => {
       }),
   );
 });
+
+/*
+1. self.clients - In a service worker, self refers to the ServiceWorkerGlobalScope
+self.clients is a built in browser API that provides access to all execution contexts (browser tabs, standalone PWA windows, iframes) on your website's origin
+matchAll({type: "window", includeUncontrolled: true}) - queries the browser for all running tabs/windows belonging to your domain
+
+type: "window" means filter the results to only actual browser tabs or PWA app windows and ignore other background execution contexts like web workers or iframes
+includeUncontrolled: true - By default matchAll() finds tabs that are actively controlled by this exact service worker. If a user refreshed the page with ctrl + F5, or opened
+the page before the serivce worker finished activating, that tab is considered "uncontrolled". Setting this to true ensures that any tab on your domain is found, even if it has not officially connected to this service worker yet
+
+clientsArr is an array of WindowClient objects representing each open tab
+*/

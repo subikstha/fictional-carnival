@@ -20,6 +20,9 @@ This reference guide documents the platform-specific requirements, restrictions,
 
 ## 2. iOS (iPhone / iPad) Strict Requirements
 
+> [!NOTE]
+> For a detailed guide on debugging iOS-specific issues like the "Nothing happened" button click bug, `isSupported()` caching traps, and remote troubleshooting checklists, see the dedicated [iOS Web Push Gotchas & Pitfalls Guide](file:///F:/projects/playground/web-push/docs/ios-web-push-gotchas-and-pitfalls.md).
+
 Apple introduced Web Push support in **iOS 16.4 / iPadOS 16.4**. To receive push notifications on iOS, **every single one** of the following conditions must be met:
 
 ### 1. Mandatory "Add to Home Screen"
