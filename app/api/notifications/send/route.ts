@@ -19,8 +19,8 @@ export async function POST(request: Request) {
     const rawEmails: string[] = Array.isArray(targetEmails)
       ? targetEmails
       : targetEmail
-      ? [targetEmail]
-      : [];
+        ? [targetEmail]
+        : [];
 
     const emails = rawEmails
       .map((e) => (typeof e === "string" ? e.trim().toLowerCase() : ""))
@@ -88,16 +88,16 @@ export async function POST(request: Request) {
         actionUrl: actionUrl,
         sentAt: new Date().toISOString(),
       },
-      webpush: {
-        headers: {
-          Urgency: "high",
-        },
-        notification: {
-          icon: "/favicon.ico",
-          badge: "/favicon.ico",
-          requireInteraction: true,
-        },
-      },
+      // webpush: {
+      //   headers: {
+      //     Urgency: "high",
+      //   },
+      //   notification: {
+      //     icon: "/favicon.ico",
+      //     badge: "/favicon.ico",
+      //     requireInteraction: true,
+      //   },
+      // },
     });
 
     // 6. Clean up stale/invalid tokens reported by Firebase

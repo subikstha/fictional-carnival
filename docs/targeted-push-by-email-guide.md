@@ -46,6 +46,8 @@ Firebase Cloud Messaging (FCM) routes notifications using **Device Registration 
   Allow users to opt into or out of specific notification categories (e.g., transactional, marketing, updates).
 * **Step 10: PWA Offline Fallback Experience**  
   Provide a dedicated offline page when the user loses internet connectivity.
+* **Step 11: OS App Badge API (`navigator.setAppBadge`)**  
+  Display unread notification counters directly on the PWA desktop taskbar icon and mobile home screen icon.
 
 ---
 
@@ -353,6 +355,8 @@ export async function POST(request: Request) {
         body: messageBody,
       },
       data: {
+        title: title,
+        body: messageBody,
         actionUrl: actionUrl,
         sentAt: new Date().toISOString(),
       },
@@ -927,6 +931,114 @@ Follow these steps to verify both foreground and background push notification be
 > **Shared Computers & Multi-User Token Reassignment**:
 > Because `deviceTokens.token` is marked `.unique()`, if Bob logs into the same physical browser profile where Alice previously logged in, the `onConflictDoUpdate` clause in Step 2 updates `userId = bob.id`. Alice will no longer receive Bob's notifications on that device.
 
+> [!CAUTION]
+> **Next.js 16 `cacheComponents: true` — Never Use `export const dynamic` in Route Handlers or Pages**
+>
+> When [`cacheComponents`](https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheComponents) is enabled in `next.config.ts`, the route segment configs `dynamic`, `revalidate`, and `fetchCache` are **completely replaced** by `"use cache"`, `cacheLife`, and `connection()`. Exporting any of them produces a hard Webpack build error:
+> ```text
+> Error: Route segment config "dynamic" is not compatible with `nextConfig.cacheComponents`. Please remove it.
+> ```
+>
+> **Why this happens**: Cache Components introduces a new rendering model where Next.js prerenders every route (including `GET` Route Handlers) at build time by default. The old `dynamic = "force-dynamic"` flag is no longer recognized — it conflicts with the new validation system.
+
+### How `connection()` Replaces `dynamic = "force-dynamic"` in Route Handlers
+
+With `cacheComponents` enabled, Next.js attempts to **prerender every `GET` Route Handler at build time** — it runs your handler during `next build` to generate a static response. Route Handlers that call `auth()`, `cookies()`, or `headers()` (Request-time APIs) need a way to tell Next.js: *"Skip prerendering — this handler requires a live request."*
+
+The [`connection()`](https://nextjs.org/docs/app/api-reference/functions/connection) function from `next/server` is that signal. When Next.js encounters `await connection()` during prerendering, it **immediately and cleanly aborts the prerender** before any of your application code runs. It uses an internal React mechanism to halt rendering above your handler, so it never reaches your `try/catch` blocks.
+
+#### The Problem Without `connection()`
+
+```
+Build starts → Next.js prerenders GET handler
+  → Enters your try/catch block
+  → auth() calls cookies()/headers() internally
+  → Next.js throws an internal prerender abort signal
+  → Your catch block catches it (it looks like a regular error)
+  → Handler returns a 500 JSON response
+  → Next.js sees a "successful" prerender with wrong content
+  → Build crashes with HANGING_PROMISE_REJECTION
+```
+
+#### The Fix With `connection()`
+
+```
+Build starts → Next.js prerenders GET handler
+  → Hits await connection()
+  → Next.js cleanly skips prerender (handler marked as dynamic)
+  → At request time, runs the full handler normally
+  → Build succeeds ✅
+```
+
+#### Correct Pattern for Dynamic Route Handlers
+
+```typescript
+// app/api/users/route.ts
+import { auth } from "@/auth";
+import { NextResponse, connection } from "next/server";
+
+// ❌ NEVER do this with cacheComponents: true
+// export const dynamic = "force-dynamic";
+
+export async function GET() {
+  // ✅ Signal that this handler needs a live request.
+  // Place BEFORE try/catch so the prerender abort is not swallowed.
+  await connection();
+
+  try {
+    const session = await auth();
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    // ... database queries ...
+    return NextResponse.json({ data });
+  } catch (error) {
+    return NextResponse.json({ error: "Server Error" }, { status: 500 });
+  }
+}
+```
+
+> [!IMPORTANT]
+> **Place `await connection()` _before_ the `try/catch` block.** If `connection()` is inside the `try`, the prerender abort signal it triggers could theoretically be caught by your `catch` block in edge cases. Placing it at the top of the handler ensures Next.js cleanly skips prerendering at the framework level before your application error handling starts.
+
+### How `<Suspense>` Replaces `dynamic = "force-dynamic"` in Pages
+
+Pages use JSX and can leverage React's `<Suspense>` boundary instead of `connection()`. The pattern is to split the page into a synchronous static shell and an async inner component:
+
+```tsx
+// app/user/notifications/page.tsx
+import { Suspense } from "react";
+import { auth } from "@/auth";
+import { redirect } from "next/navigation";
+
+// ❌ NEVER do this with cacheComponents: true
+// export const dynamic = "force-dynamic";
+
+// Inner async component — calls Request-time APIs
+async function NotificationsContent() {
+  const session = await auth();
+  if (!session) redirect("/login");
+  return <main>...</main>;
+}
+
+// Outer synchronous component — Next.js prerenders this into a static shell
+export default function NotificationsPage() {
+  return (
+    <Suspense fallback={<p>Loading...</p>}>
+      <NotificationsContent />
+    </Suspense>
+  );
+}
+```
+
+The outer component is **synchronous and static** — Next.js prerenders it into an instant HTML shell. The async `NotificationsContent` (which calls `auth()`) is wrapped in `<Suspense>`, telling Next.js: *"This part is dynamic — render the fallback at build time and stream the real content at request time."*
+
+| Mechanism | Where to use | What it does |
+|:---|:---|:---|
+| `await connection()` | `GET` Route Handlers (`route.ts`) | Cleanly aborts prerender; handler runs only at request time |
+| `<Suspense fallback={...}>` | Pages and Layouts (`page.tsx`, `layout.tsx`) | Prerenders the shell with the fallback; streams dynamic content at request time |
+| `export const instant = false` | Pages/Layouts not ready to migrate yet | Allows the page to block navigation (opt out of instant validation) without fully migrating |
+
 ---
 
 ## Notification Payload Architecture: Foreground vs. Background
@@ -1165,8 +1277,21 @@ export function LogoutButton() {
 
   const handleLogout = async () => {
     setLoading(true);
+    // 1. Locate token from user-specific key or scan for any active fcmToken_*
     const storageKey = `fcmToken_${session?.user?.name || "current"}`;
-    const currentToken = localStorage.getItem(storageKey);
+    let currentToken = localStorage.getItem(storageKey);
+    const keysToRemove: string[] = [storageKey];
+
+    if (!currentToken) {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith("fcmToken_")) {
+          currentToken = localStorage.getItem(key);
+          keysToRemove.push(key);
+          break;
+        }
+      }
+    }
 
     try {
       if (currentToken) {
@@ -1186,8 +1311,8 @@ export function LogoutButton() {
     } catch (err) {
       console.error("Error cleaning up push token on logout:", err);
     } finally {
-      // 3. Purge storage and clear session
-      localStorage.removeItem(storageKey);
+      // 3. Purge all stored tokens and clear session
+      keysToRemove.forEach((k) => localStorage.removeItem(k));
       await signOut({ callbackUrl: "/login" });
       setLoading(false);
     }
@@ -1204,6 +1329,88 @@ export function LogoutButton() {
   );
 }
 ```
+
+---
+
+### FCM Token Expiration & Rotation Lifecycle
+
+A common question is whether FCM tokens expire. They **do not have a fixed expiration date** (unlike JWTs), but they **can and do become invalid** through several mechanisms.
+
+#### When an FCM Token Becomes Invalid
+
+| Scenario | Cause | Detection |
+|:---|:---|:---|
+| User clears browser / site data | Token destroyed along with service worker registration | Next `getToken()` returns a new token |
+| User revokes notification permission | Token invalidated by the browser | `Notification.permission` reads `"default"` or `"denied"` |
+| Browser profile is deleted | Token gone with the profile | No client-side detection possible |
+| Firebase rotates the token | Periodic rotation (no guaranteed schedule — could be weeks or months) | Next `getToken()` returns a new token |
+| App not opened for ~2 months | Firebase may garbage-collect inactive tokens | Send failure: `messaging/registration-token-not-registered` |
+| Service worker is unregistered | Push subscription is severed | Next `getToken()` returns a new token |
+| User uninstalls the PWA | Browser cleans up service worker and token | No client-side detection possible |
+
+> [!NOTE]
+> Firebase does **not** document a specific expiration timeframe. Tokens can remain valid for months or even years if the user keeps the app installed and the browser profile intact. The ~2 month inactivity window is an observed behavior, not an official guarantee.
+
+#### How This App Handles Token Rotation (Already Implemented)
+
+This project covers both sides of the lifecycle — **refresh on load** (client) and **prune on failure** (server):
+
+**1. Client-side: Refresh on every session (`PushManager.tsx`)**
+
+```tsx
+// In PushManager.tsx useEffect:
+if (currentPerm === "granted") {
+  retrieveToken(); // calls getToken() on every page load
+}
+```
+
+Every time the app loads and permission is `"granted"`, `getToken()` is called. If Firebase has rotated the token, `getToken()` transparently returns the new one. The result is sent to the backend via `/api/notifications/register-token`, which uses `onConflictDoUpdate` — so if the token changed, the new one replaces the old in the `deviceTokens` table.
+
+**2. Server-side: Prune dead tokens on send failure (`/api/notifications/send`)**
+
+```tsx
+// In the send route, after sendEachForMulticast:
+const failedTokens = responses
+  .filter((r) => !r.success)
+  .filter((r) => {
+    const code = r.error?.code;
+    return (
+      code === "messaging/registration-token-not-registered" ||
+      code === "messaging/invalid-registration-token"
+    );
+  })
+  .map((_, i) => tokens[i]);
+
+// Delete stale tokens from the database
+if (failedTokens.length > 0) {
+  await db.delete(deviceTokens).where(inArray(deviceTokens.token, failedTokens));
+}
+```
+
+When Firebase returns `messaging/registration-token-not-registered` or `messaging/invalid-registration-token`, the token is automatically purged from the database, preventing wasted quota on future sends.
+
+#### Token Lifecycle Flow
+
+```
+User opens app → getToken() called
+  │
+  ├── Token unchanged → backend upsert is a no-op
+  │
+  ├── Token was rotated by Firebase → getToken() returns NEW token
+  │   └── Backend upsert replaces old token with new one ✅
+  │
+  ├── Token is invalid (site data cleared, SW unregistered)
+  │   └── getToken() generates a brand new token
+  │       └── Backend inserts the new token ✅
+  │
+  └── User never reopens app (~2 months)
+      └── Firebase GC's the token
+          └── Next send attempt returns registration-token-not-registered
+              └── Server prunes the dead token from DB ✅
+```
+
+> [!TIP]
+> **No additional code is needed.** The combination of calling `getToken()` on every page load and pruning dead tokens on send failure covers all token rotation and expiration scenarios. There is no `onTokenRefresh` callback to implement — in modern Firebase Web SDK (v9+), `getToken()` itself handles rotation transparently.
 
 ---
 
@@ -1343,59 +1550,76 @@ self.addEventListener("notificationclick", (event) => {
 
 Because `app/api/notifications/send/route.ts` records every message into the PostgreSQL `notifications` table, you can give users a persistent notification center in your header.
 
-### 8.1 Create Notifications Fetch Route (`app/api/notifications/route.ts`)
+### 8.1 Create Notifications Fetch Route (`app/api/notifications/route.ts` or `/api/notifications/get`)
+
+> [!IMPORTANT]
+> **Always call `await connection()` from `next/server`** before accessing `auth()` so that Next.js 16 (with `cacheComponents: true`) cleanly skips build-time prerendering.
 
 ```typescript
-// app/api/notifications/route.ts
-import { NextResponse } from "next/server";
+// app/api/notifications/route.ts (or app/api/notifications/get/route.ts)
+import { NextResponse, connection } from "next/server";
 import { auth } from "@/auth";
 import { db } from "@/lib/connection";
 import { notifications, users } from "@/lib/schema";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 
 export async function GET() {
+  await connection();
+
   const session = await auth();
-  if (!session?.user?.email) {
+  if (!session?.user?.id && !session?.user?.email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const [user] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.email, session.user.email))
-    .limit(1);
+  // Find user by session id or email
+  let userId = session.user.id;
+  if (!userId) {
+    const [user] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, session.user.email!))
+      .limit(1);
 
-  if (!user) {
-    return NextResponse.json({ error: "User not found" }, { status: 404 });
+    if (!user) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
+    userId = user.id;
   }
 
   const userNotifications = await db
     .select()
     .from(notifications)
-    .where(eq(notifications.userId, user.id))
+    .where(eq(notifications.userId, userId))
     .orderBy(desc(notifications.createdAt))
-    .limit(30);
+    .limit(50);
 
-  return NextResponse.json({ notifications: userNotifications });
+  const unreadCount = userNotifications.filter((n) => !n.isRead).length;
+
+  return NextResponse.json({
+    notifications: userNotifications,
+    unreadCount,
+  });
 }
 ```
 
-### 8.2 Mark as Read Endpoint (`app/api/notifications/[id]/read/route.ts`)
+### 8.2 Mark as Read Endpoints
 
+#### Single Notification: `app/api/notifications/[id]/read/route.ts`
 ```typescript
 // app/api/notifications/[id]/read/route.ts
-import { NextResponse } from "next/server";
+import { NextResponse, connection } from "next/server";
 import { auth } from "@/auth";
 import { db } from "@/lib/connection";
 import { notifications } from "@/lib/schema";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  await connection();
   const session = await auth();
-  if (!session?.user?.email) {
+  if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -1403,8 +1627,43 @@ export async function PATCH(
 
   await db
     .update(notifications)
-    .set({ isRead: true })
-    .where(eq(notifications.id, id));
+    .set({ isRead: true, readAt: new Date() })
+    .where(
+      and(
+        eq(notifications.id, id),
+        eq(notifications.userId, session.user.id)
+      )
+    );
+
+  return NextResponse.json({ success: true });
+}
+```
+
+#### Mark All as Read: `app/api/notifications/read-all/route.ts`
+```typescript
+// app/api/notifications/read-all/route.ts
+import { NextResponse, connection } from "next/server";
+import { auth } from "@/auth";
+import { db } from "@/lib/connection";
+import { notifications } from "@/lib/schema";
+import { eq, and } from "drizzle-orm";
+
+export async function POST() {
+  await connection();
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  await db
+    .update(notifications)
+    .set({ isRead: true, readAt: new Date() })
+    .where(
+      and(
+        eq(notifications.userId, session.user.id),
+        eq(notifications.isRead, false)
+      )
+    );
 
   return NextResponse.json({ success: true });
 }
@@ -1418,21 +1677,14 @@ A bell icon with an unread badge that opens a dropdown popover:
 // components/NotificationBell.tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import Link from "next/link";
-
-interface NotificationItem {
-  id: string;
-  title: string;
-  body: string;
-  actionUrl: string | null;
-  isRead: boolean;
-  createdAt: string;
-}
+import type { Notification } from "@/lib/schema";
 
 export function NotificationBell() {
-  const [items, setItems] = useState<NotificationItem[]>([]);
+  const [items, setItems] = useState<Notification[]>([]);
   const [open, setOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const fetchNotifications = async () => {
     try {
@@ -1448,6 +1700,15 @@ export function NotificationBell() {
 
   useEffect(() => {
     fetchNotifications();
+
+    // Close popover when clicking outside
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
   const unreadCount = items.filter((n) => !n.isRead).length;
@@ -1459,8 +1720,13 @@ export function NotificationBell() {
     );
   };
 
+  const markAllAsRead = async () => {
+    await fetch("/api/notifications/read-all", { method: "POST" });
+    setItems((prev) => prev.map((n) => ({ ...n, isRead: true })));
+  };
+
   return (
-    <div className="relative">
+    <div className="relative" ref={dropdownRef}>
       <button
         onClick={() => setOpen(!open)}
         className="relative p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
@@ -1480,7 +1746,7 @@ export function NotificationBell() {
           />
         </svg>
         {unreadCount > 0 && (
-          <span className="absolute top-1 right-1 flex items-center justify-center w-4 h-4 text-[10px] font-bold text-white bg-rose-600 rounded-full">
+          <span className="absolute top-1 right-1 flex items-center justify-center min-w-[16px] h-4 px-1 text-[10px] font-bold text-white bg-rose-600 rounded-full animate-pulse">
             {unreadCount > 9 ? "9+" : unreadCount}
           </span>
         )}
@@ -1491,7 +1757,12 @@ export function NotificationBell() {
           <div className="p-3 border-b border-zinc-200 dark:border-zinc-800 flex justify-between items-center">
             <span className="text-sm font-semibold">Notifications</span>
             {unreadCount > 0 && (
-              <span className="text-xs text-zinc-500">{unreadCount} unread</span>
+              <button
+                onClick={markAllAsRead}
+                className="text-xs text-blue-600 hover:text-blue-700 dark:text-blue-400 font-medium"
+              >
+                Mark all read
+              </button>
             )}
           </div>
 
@@ -1501,7 +1772,7 @@ export function NotificationBell() {
                 No notifications yet.
               </p>
             ) : (
-              items.map((item) => (
+              items.slice(0, 10).map((item) => (
                 <div
                   key={item.id}
                   className={`p-3 text-xs transition-colors ${
@@ -1511,13 +1782,13 @@ export function NotificationBell() {
                   }`}
                 >
                   <p className="font-semibold">{item.title}</p>
-                  <p className="mt-0.5">{item.body}</p>
+                  <p className="mt-0.5 text-zinc-600 dark:text-zinc-400">{item.body}</p>
                   <div className="mt-2 flex items-center justify-between">
                     {item.actionUrl ? (
                       <Link
                         href={item.actionUrl}
                         onClick={() => markAsRead(item.id)}
-                        className="text-blue-600 dark:text-blue-400 hover:underline"
+                        className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
                       >
                         View &rarr;
                       </Link>
@@ -1537,6 +1808,16 @@ export function NotificationBell() {
               ))
             )}
           </div>
+
+          <div className="p-2 border-t border-zinc-200 dark:border-zinc-800 text-center bg-zinc-50 dark:bg-zinc-950">
+            <Link
+              href="/user/notifications"
+              onClick={() => setOpen(false)}
+              className="text-xs text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 font-medium"
+            >
+              See all notifications &rarr;
+            </Link>
+          </div>
         </div>
       )}
     </div>
@@ -1544,7 +1825,198 @@ export function NotificationBell() {
 }
 ```
 
-Mount `<NotificationBell />` inside `components/Header.tsx` next to your user greeting and logout button.
+### 8.4 Mount `<NotificationBell />` in `components/Header.tsx`
+
+Update `components/Header.tsx` so authenticated users see the Notification Bell right next to their username and logout button:
+
+```tsx
+// components/Header.tsx
+import { Suspense } from "react";
+import Link from "next/link";
+import { auth } from "@/auth";
+import { LogoutButton } from "./LogoutButton";
+import { NotificationBell } from "./NotificationBell";
+
+async function AuthNav() {
+  const session = await auth();
+  const user = session?.user;
+
+  if (user) {
+    return (
+      <div className="flex items-center gap-4 text-sm">
+        <NotificationBell />
+        <span className="text-zinc-600 dark:text-zinc-400">
+          Signed in as{" "}
+          <strong className="text-zinc-900 dark:text-zinc-100 font-semibold">
+            {user.name || user.email}
+          </strong>
+        </span>
+        <LogoutButton />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-4 text-sm">
+      <Link href="/login" className="text-zinc-600 hover:text-zinc-900 font-medium">
+        Log in
+      </Link>
+      <Link href="/signup" className="px-3 py-1.5 rounded-md bg-zinc-900 text-white font-medium">
+        Sign up
+      </Link>
+    </div>
+  );
+}
+```
+
+### 8.5 Interactive Notifications Inbox (`components/NotificationsClient.tsx`)
+
+Enhance the full page at `/user/notifications` with unread tabs, "Mark as Read", "Mark All Read", and formatted timestamps:
+
+```tsx
+// components/NotificationsClient.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import type { Notification } from "@/lib/schema";
+
+export default function NotificationsClient() {
+  const [items, setItems] = useState<Notification[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState<"all" | "unread">("all");
+
+  const loadNotifications = async () => {
+    try {
+      const res = await fetch("/api/notifications");
+      if (res.ok) {
+        const data = await res.json();
+        setItems(data.notifications || []);
+      }
+    } catch (err) {
+      console.error("Failed to load notifications:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadNotifications();
+  }, []);
+
+  const markAsRead = async (id: string) => {
+    await fetch(`/api/notifications/${id}/read`, { method: "PATCH" });
+    setItems((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
+    );
+  };
+
+  const markAllAsRead = async () => {
+    await fetch("/api/notifications/read-all", { method: "POST" });
+    setItems((prev) => prev.map((n) => ({ ...n, isRead: true })));
+  };
+
+  const filteredItems = items.filter((n) =>
+    filter === "unread" ? !n.isRead : true
+  );
+  const unreadCount = items.filter((n) => !n.isRead).length;
+
+  if (loading) return <p className="animate-pulse text-sm text-zinc-500">Loading notifications...</p>;
+
+  return (
+    <div className="space-y-4">
+      {/* Action Bar */}
+      <div className="flex items-center justify-between pb-3 border-b border-zinc-200 dark:border-zinc-800">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setFilter("all")}
+            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+              filter === "all"
+                ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+            }`}
+          >
+            All ({items.length})
+          </button>
+          <button
+            onClick={() => setFilter("unread")}
+            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+              filter === "unread"
+                ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+            }`}
+          >
+            Unread ({unreadCount})
+          </button>
+        </div>
+
+        {unreadCount > 0 && (
+          <button
+            onClick={markAllAsRead}
+            className="text-xs text-blue-600 hover:underline font-medium cursor-pointer"
+          >
+            Mark all as read
+          </button>
+        )}
+      </div>
+
+      {filteredItems.length === 0 ? (
+        <p className="text-sm text-zinc-500 py-8 text-center">
+          {filter === "unread" ? "No unread notifications." : "No notifications found."}
+        </p>
+      ) : (
+        <ul className="space-y-3">
+          {filteredItems.map((n) => (
+            <li
+              key={n.id}
+              className={`p-4 border rounded-lg transition-all ${
+                n.isRead
+                  ? "bg-white dark:bg-zinc-950 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400"
+                  : "bg-blue-50/40 dark:bg-blue-950/20 border-blue-200 dark:border-blue-900 text-zinc-900 dark:text-zinc-100 shadow-xs"
+              }`}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    {!n.isRead && (
+                      <span className="w-2 h-2 rounded-full bg-blue-600 shrink-0" />
+                    )}
+                    <h2 className="font-semibold text-sm">{n.title}</h2>
+                  </div>
+                  <p className="text-xs text-zinc-600 dark:text-zinc-300 leading-relaxed">{n.body}</p>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {n.actionUrl && (
+                    <Link
+                      href={n.actionUrl}
+                      onClick={() => markAsRead(n.id)}
+                      className="text-xs text-blue-600 hover:underline font-medium"
+                    >
+                      View &rarr;
+                    </Link>
+                  )}
+                  {!n.isRead && (
+                    <button
+                      onClick={() => markAsRead(n.id)}
+                      className="text-xs text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                    >
+                      Mark read
+                    </button>
+                  )}
+                </div>
+              </div>
+              <p className="text-[10px] text-zinc-400 mt-3">
+                {new Date(n.createdAt).toLocaleString()}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+```
 
 ---
 
@@ -1553,41 +2025,118 @@ Mount `<NotificationBell />` inside `components/Header.tsx` next to your user gr
 Using the `notificationPreferences` table defined in `lib/schema.ts`:
 
 ```typescript
+// lib/schema.ts
 export const notificationPreferences = pgTable("notification_preferences", {
   id: uuid("id").primaryKey().defaultRandom(),
-  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-  type: text("type").notNull(), // 'marketing' | 'orders' | 'security'
-  enabled: boolean("enabled").notNull().default(true),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
+  userId: uuid("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  pushEnabled: boolean("push_enabled").notNull().default(true),
+  emailEnabled: boolean("email_enabled").notNull().default(true),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
 });
 ```
 
-### 9.1 Filter Before Dispatching Push
-In `app/api/notifications/send/route.ts`, accept an optional `category` (e.g., `'marketing'`) and verify the recipient hasn't disabled it:
+### 9.1 Preferences API Endpoint (`app/api/user/preferences/route.ts`)
 
 ```typescript
-// Inside app/api/notifications/send/route.ts:
-const { targetEmail, title, body: messageBody, category = "transactional" } = body;
+// app/api/user/preferences/route.ts
+import { NextResponse, connection } from "next/server";
+import { auth } from "@/auth";
+import { db } from "@/lib/connection";
+import { notificationPreferences } from "@/lib/schema";
+import { eq } from "drizzle-orm";
 
-// Check user preferences
-const [pref] = await db
-  .select({ enabled: notificationPreferences.enabled })
-  .from(notificationPreferences)
-  .where(
-    and(
-      eq(notificationPreferences.userId, user.id),
-      eq(notificationPreferences.type, category)
-    )
-  )
-  .limit(1);
+export async function GET() {
+  await connection();
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
-if (pref && !pref.enabled) {
-  return NextResponse.json(
-    { message: `User has muted "${category}" notifications. Skipped delivery.` },
-    { status: 200 }
-  );
+  // Get or initialize preferences
+  let [prefs] = await db
+    .select()
+    .from(notificationPreferences)
+    .where(eq(notificationPreferences.userId, session.user.id))
+    .limit(1);
+
+  if (!prefs) {
+    [prefs] = await db
+      .insert(notificationPreferences)
+      .values({ userId: session.user.id, pushEnabled: true, emailEnabled: true })
+      .returning();
+  }
+
+  return NextResponse.json({ preferences: prefs });
+}
+
+export async function PATCH(request: Request) {
+  await connection();
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const body = await request.json();
+  const { pushEnabled, emailEnabled } = body;
+
+  const [updated] = await db
+    .insert(notificationPreferences)
+    .values({
+      userId: session.user.id,
+      pushEnabled: pushEnabled ?? true,
+      emailEnabled: emailEnabled ?? true,
+    })
+    .onConflictDoUpdate({
+      target: notificationPreferences.userId,
+      set: {
+        ...(pushEnabled !== undefined && { pushEnabled }),
+        ...(emailEnabled !== undefined && { emailEnabled }),
+        updatedAt: new Date(),
+      },
+    })
+    .returning();
+
+  return NextResponse.json({ preferences: updated });
 }
 ```
+
+### 9.2 Filter Muted Users Before Dispatching Push (`app/api/notifications/send/route.ts`)
+
+When dispatching, query `notificationPreferences` alongside `users`:
+
+```typescript
+// Inside app/api/notifications/send/route.ts
+// 1. Check if recipient has muted push notifications
+const preferences = await db
+  .select({
+    userId: notificationPreferences.userId,
+    pushEnabled: notificationPreferences.pushEnabled,
+  })
+  .from(notificationPreferences)
+  .where(inArray(notificationPreferences.userId, userIds));
+
+const mutedUserIds = new Set(
+  preferences.filter((p) => !p.pushEnabled).map((p) => p.userId)
+);
+
+// 2. Filter device tokens: only send push to users where push is NOT muted
+const eligibleUserIds = userIds.filter((id) => !mutedUserIds.has(id));
+
+// Tokens to multicast:
+const tokenRecords = eligibleUserIds.length > 0
+  ? await db
+      .select({ token: deviceTokens.token })
+      .from(deviceTokens)
+      .where(inArray(deviceTokens.userId, eligibleUserIds))
+  : [];
+```
+*(Notice: The in-app notification inbox insert still saves for all targeted users so they can read the notification when they open the app, while their OS desktop push is cleanly respected!)*
 
 ---
 
@@ -1599,7 +2148,31 @@ To guarantee offline PWA capabilities when internet connectivity is lost:
 
 ```tsx
 // app/offline/page.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+
 export default function OfflinePage() {
+  const [isOnline, setIsOnline] = useState(false);
+
+  useEffect(() => {
+    setIsOnline(navigator.onLine);
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      window.location.reload();
+    };
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh] p-6 text-center">
       <div className="p-4 bg-zinc-100 dark:bg-zinc-800 rounded-full mb-4">
@@ -1623,7 +2196,7 @@ export default function OfflinePage() {
       </p>
       <button
         onClick={() => window.location.reload()}
-        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium transition-colors"
+        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium transition-colors cursor-pointer"
       >
         Retry Connection
       </button>
@@ -1632,4 +2205,63 @@ export default function OfflinePage() {
 }
 ```
 
-Configure `next.config.ts` with `fallbacks: { document: "/offline" }` under `withPWAInit` so `next-pwa` serves this page automatically whenever network requests fail.
+### 10.2 Configure Fallback in `next.config.ts`
+
+Configure `next.config.ts` with `fallbacks: { document: "/offline" }` under `withPWAInit` so `next-pwa` serves this page automatically whenever network requests fail:
+
+```typescript
+// next.config.ts
+const withPWA = withPWAInit({
+  dest: "public",
+  register: true,
+  skipWaiting: true,
+  disable: process.env.NODE_ENV === "development",
+  fallbacks: {
+    document: "/offline", // Serves /offline whenever network fetch fails
+  },
+  importScripts: [
+    "https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js",
+    "https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js",
+    "/firebase-messaging-sw.js",
+  ],
+});
+```
+
+---
+
+## Step 11: OS App Badge API (`navigator.setAppBadge`)
+
+The Web Badging API allows installed PWAs on Windows (taskbar icon), Android (launcher icon badge), and macOS (dock) to display a notification count directly on the application icon.
+
+### 11.1 Update the Badge in Service Worker (`public/firebase-messaging-sw.js`)
+
+When a push arrives, increment or set the badge:
+
+```javascript
+// Inside public/firebase-messaging-sw.js:
+self.addEventListener("push", (event) => {
+  // ... show notification logic ...
+
+  // Update OS App Badge if supported
+  if ("setAppBadge" in navigator) {
+    // Increment or set to unread count if provided in payload
+    const badgeCount = parseInt(data.unreadCount || "1", 10);
+    navigator.setAppBadge(badgeCount).catch((err) => {
+      console.warn("Failed to set app badge", err);
+    });
+  }
+});
+```
+
+### 11.2 Clear the Badge when User Views Notifications
+
+When the user opens the notification inbox or marks items as read:
+
+```typescript
+// Inside components/NotificationsClient.tsx or NotificationBell.tsx:
+const clearBadge = () => {
+  if ("clearAppBadge" in navigator) {
+    navigator.clearAppBadge().catch((err) => console.warn(err));
+  }
+};
+```
