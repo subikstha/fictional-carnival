@@ -85,6 +85,13 @@ export function PushManager({
       const perm = await Notification.requestPermission();
       setPermission(perm);
 
+      if (perm === "denied") {
+        alert(
+          "Notifications are blocked in your browser settings. Please enable them from the address bar",
+        );
+        return;
+      }
+
       if (perm !== "granted") {
         alert("Notification permission denied");
         return;

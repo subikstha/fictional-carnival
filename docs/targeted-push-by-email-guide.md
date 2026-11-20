@@ -1627,6 +1627,84 @@ User clicks notification
                Browser puts SW back to sleep
 ```
 
+### 7.4 Consuming `client.postMessage` on the Main Thread (React / Next.js)
+
+When `client.postMessage({ type: "FCM_ACTION", payload: payloadData })` is executed by the Service Worker, the message is dispatched to the browser's main JavaScript thread.
+
+#### Where does it go if nobody is listening?
+If your frontend has no active listener attached, the browser **safely discards the message with zero errors or performance penalties**. It functions as a forward-compatible hook.
+
+#### How to Listen for Service Worker Messages in React
+
+To consume these messages in the main thread, attach a listener to `navigator.serviceWorker` inside a `useEffect` hook:
+
+```tsx
+// Example: Consuming Service Worker messages in a React component
+"use client";
+
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+
+export function useServiceWorkerNotifications() {
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+
+    const handleServiceWorkerMessage = (event: MessageEvent) => {
+      // 1. Verify message structure
+      if (event.data?.type === "FCM_ACTION") {
+        console.log("Notification clicked! Payload received on main thread:", event.data.payload);
+
+        const { actionUrl, title, body } = event.data.payload;
+
+        // 2. Perform instant client-side actions:
+        // A. Smooth client-side SPA transition (avoids hard page reload):
+        if (actionUrl) {
+          router.push(actionUrl);
+        }
+
+        // B. Or trigger an in-app toast/banner or audio chime
+      }
+    };
+
+    // 3. Register the listener
+    navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
+
+    // 4. Clean up on unmount
+    return () => {
+      navigator.serviceWorker.removeEventListener("message", handleServiceWorkerMessage);
+    };
+  }, [router]);
+}
+```
+
+#### Practical Use Cases in This Application
+
+| Use Case | Component | Benefit |
+| :--- | :--- | :--- |
+| **Instant Inbox Refresh** | [components/NotificationsClient.tsx](file:///F:/projects/playground/web-push/components/NotificationsClient.tsx) | Automatically invokes `loadNotifications()` to fetch the new item into the UI without forcing the user to press browser refresh. |
+| **Real-Time Bell Badge** | [components/NotificationBell.tsx](file:///F:/projects/playground/web-push/components/NotificationBell.tsx) | Updates or clears the red unread count badge in the Header instantly upon user interaction. |
+| **Next.js SPA Routing** | `app/layout.tsx` or Header | Uses `router.push(targetUrl)` instead of `client.navigate(targetUrl)`, preserving in-memory React state and avoiding full page re-renders. |
+
+#### Implementation Example in `NotificationsClient.tsx`:
+
+```tsx
+// Inside components/NotificationsClient.tsx:
+useEffect(() => {
+  if (!("serviceWorker" in navigator)) return;
+
+  const handleMessage = (event: MessageEvent) => {
+    if (event.data?.type === "FCM_ACTION") {
+      // Automatically reload notifications when the tab is focused via a notification click
+      loadNotifications();
+    }
+  };
+
+  navigator.serviceWorker.addEventListener("message", handleMessage);
+  return () => navigator.serviceWorker.removeEventListener("message", handleMessage);
+}, []);
+```
 
 ---
 
